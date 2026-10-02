@@ -15,6 +15,7 @@ class FakeLightroom:
         self.labels = {}
         self.renders = 0
         self.rejected_keys = set()  # keys this "Lightroom" silently ignores
+        self.mask_calls = []
 
     def ping(self):
         return {"version": "fake"}
@@ -46,6 +47,23 @@ class FakeLightroom:
             Image.fromarray((img * 255).round().astype(np.uint8)).save(item["path"], quality=95)
             self.renders += 1
         return [item["path"] for item in items]
+
+    def get_settings(self, items):
+        return [{"id": i["id"], "settings": dict(self.photos[i["id"]]["settings"])} for i in items]
+
+    def mask_adjust(self, photo_id, kind, values):
+        settings = self.photos[photo_id]["settings"]
+        corrections = settings.setdefault("MaskGroupBasedCorrections", [])
+        name = f"Match Look {kind}"
+        ours = next((c for c in corrections if c.get("CorrectionName") == name), None)
+        created = ours is None
+        if created:
+            ours = {"CorrectionName": name}
+            corrections.append(ours)
+        for key, value in values.items():
+            ours[key] = value if key == "LocalExposure2012" else value / 100
+        self.mask_calls.append((photo_id, kind, dict(values)))
+        return {"created": created, "found": True, "values": dict(values)}
 
     def snapshot(self, items):
         self.snapshots.extend((i["id"], i["name"], dict(self.photos[i["id"]]["settings"])) for i in items)

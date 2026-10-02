@@ -74,6 +74,17 @@ class Bridge:
         """items: [{"id": ..., "path": "/abs/out.jpg"}]; returns the same paths."""
         return self.call("render", items=items, size=size, timeout=60 + 10 * len(items))
 
+    def get_settings(self, items):
+        """items: [{"id": ...}] -> [{"id": ..., "settings": {...}}]"""
+        return self.call("get_settings", items=items)
+
+    def mask_adjust(self, photo_id, kind, values):
+        """Experimental: create (or update) an AI mask of `kind` ("subject", "sky",
+        "background", "people") on one photo and set its local sliders to
+        `values` (UI units, e.g. {"LocalTemperature": -10, "LocalExposure2012": 0.2}).
+        Drives Lightroom's Develop module, so it can take a while."""
+        return self.call("mask_adjust", id=photo_id, kind=kind, values=values, timeout=90)
+
     def snapshot(self, items):
         """items: [{"id": ..., "name": ...}]"""
         return self.call("snapshot", items=items)

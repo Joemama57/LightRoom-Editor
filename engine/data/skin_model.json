@@ -1,0 +1,316 @@
+{
+ "built_from": "data/skin_sources.json",
+ "sources": {
+  "populations": "Lu et al. (2026), 'Skin Colour Does Not Define Ethnicity: Quantifying Variation and Overlap Across Diverse Populations', Skin Research and Technology, Table 2. https://doi.org/10.1111/srt.70343 (open access, CC BY 4.0). Values are mean (SD) of in-vivo CIELAB measurements.",
+  "facial_hue": "Wang, Xiao, Wuerger, Cheung & Luo (2015), 'Measuring Human Skin Colour', 23rd Color and Imaging Conference, pp. 230-234. 188 subjects, 10 body locations incl. forehead, cheek, cheekbone, chin, nose tip; CM700d spectrophotometer and PR650 tele-spectroradiometer, D65 / CIE 1931.",
+  "monk": "Monk Skin Tone Scale (Ellis Monk, Google, 2022), released under CC BY 4.0. https://skintone.google/ ; hex values as listed at https://en.wikipedia.org/wiki/Monk_Skin_Tone_Scale",
+  "ita": "Chardon, Cretois & Hourseau (1991), 'Skin colour typology and suntanning pathways', Int J Cosmet Sci 13:191-208. ITA = atan((L* - 50) / b*) in degrees."
+ },
+ "detector": {
+  "hue_center": 58.63,
+  "hue_sd": 10.2,
+  "hue_range": [
+   33.1,
+   84.1
+  ],
+  "chroma_range": [
+   8.0,
+   52.4
+  ],
+  "L_range": [
+   15.0,
+   84.7
+  ]
+ },
+ "population": {
+  "n_measurements": 14532,
+  "hue_mean": 58.63,
+  "hue_sd": 8.89,
+  "chroma_mean": 19.91,
+  "chroma_sd": 3.15,
+  "L_range_3sd": [
+   19.5,
+   79.7
+  ],
+  "facial_hue_range": [
+   45,
+   69
+  ]
+ },
+ "groups": [
+  {
+   "name": "Caucasian",
+   "code": "CA",
+   "n": 2376,
+   "L": 61.2,
+   "sL": 5.4,
+   "a": 11.0,
+   "sa": 3.9,
+   "b": 14.7,
+   "sb": 2.7,
+   "C": 18.36,
+   "sC": 3.2,
+   "h": 53.19,
+   "sh": 10.97,
+   "ita": 37.3,
+   "ita_class": "intermediate"
+  },
+  {
+   "name": "Chinese",
+   "code": "CN",
+   "n": 2736,
+   "L": 59.8,
+   "sL": 4.3,
+   "a": 10.1,
+   "sa": 2.9,
+   "b": 16.7,
+   "sb": 2.4,
+   "C": 19.52,
+   "sC": 2.6,
+   "h": 58.83,
+   "sh": 8.15,
+   "ita": 30.41,
+   "ita_class": "intermediate"
+  },
+  {
+   "name": "Japanese",
+   "code": "JP",
+   "n": 944,
+   "L": 63.5,
+   "sL": 4.2,
+   "a": 9.8,
+   "sa": 2.7,
+   "b": 17.0,
+   "sb": 2.6,
+   "C": 19.62,
+   "sC": 2.5,
+   "h": 60.04,
+   "sh": 7.81,
+   "ita": 38.45,
+   "ita_class": "intermediate"
+  },
+  {
+   "name": "South Asian",
+   "code": "SA",
+   "n": 1289,
+   "L": 52.7,
+   "sL": 6.4,
+   "a": 10.4,
+   "sa": 2.5,
+   "b": 17.9,
+   "sb": 2.3,
+   "C": 20.7,
+   "sC": 2.4,
+   "h": 59.84,
+   "sh": 6.78,
+   "ita": 8.58,
+   "ita_class": "brown"
+  },
+  {
+   "name": "African",
+   "code": "AF",
+   "n": 929,
+   "L": 39.6,
+   "sL": 6.7,
+   "a": 10.2,
+   "sa": 2.0,
+   "b": 14.4,
+   "sb": 4.3,
+   "C": 17.65,
+   "sC": 4.4,
+   "h": 54.69,
+   "sh": 9.65,
+   "ita": -35.84,
+   "ita_class": "dark"
+  },
+  {
+   "name": "Iraqi",
+   "code": "IQ",
+   "n": 1183,
+   "L": 57.3,
+   "sL": 5.5,
+   "a": 10.2,
+   "sa": 3.2,
+   "b": 15.8,
+   "sb": 2.4,
+   "C": 18.81,
+   "sC": 2.7,
+   "h": 57.15,
+   "sh": 9.1,
+   "ita": 24.8,
+   "ita_class": "tan"
+  },
+  {
+   "name": "Thai",
+   "code": "TH",
+   "n": 4112,
+   "L": 56.4,
+   "sL": 5.6,
+   "a": 10.0,
+   "sa": 2.4,
+   "b": 19.0,
+   "sb": 2.6,
+   "C": 21.47,
+   "sC": 2.7,
+   "h": 62.24,
+   "sh": 6.52,
+   "ita": 18.62,
+   "ita_class": "tan"
+  },
+  {
+   "name": "Arabian",
+   "code": "AB",
+   "n": 963,
+   "L": 60.2,
+   "sL": 6.5,
+   "a": 10.9,
+   "sa": 3.0,
+   "b": 17.9,
+   "sb": 2.5,
+   "C": 20.96,
+   "sC": 2.7,
+   "h": 58.66,
+   "sh": 7.86,
+   "ita": 29.68,
+   "ita_class": "intermediate"
+  }
+ ],
+ "ita_classes": [
+  {
+   "name": "very light",
+   "min": 55
+  },
+  {
+   "name": "light",
+   "min": 41
+  },
+  {
+   "name": "intermediate",
+   "min": 28
+  },
+  {
+   "name": "tan",
+   "min": 10
+  },
+  {
+   "name": "brown",
+   "min": -30
+  },
+  {
+   "name": "dark",
+   "min": -90
+  }
+ ],
+ "monk": [
+  {
+   "tone": 1,
+   "hex": "#f6ede4",
+   "L": 94.21,
+   "a": 1.5,
+   "b": 5.43,
+   "C": 5.63,
+   "h": 74.5,
+   "ita": 83.0,
+   "ita_class": "very light"
+  },
+  {
+   "tone": 2,
+   "hex": "#f3e7db",
+   "L": 92.27,
+   "a": 2.06,
+   "b": 7.29,
+   "C": 7.57,
+   "h": 74.2,
+   "ita": 80.2,
+   "ita_class": "very light"
+  },
+  {
+   "tone": 3,
+   "hex": "#f7ead0",
+   "L": 93.09,
+   "a": 0.22,
+   "b": 14.21,
+   "C": 14.21,
+   "h": 89.1,
+   "ita": 71.7,
+   "ita_class": "very light"
+  },
+  {
+   "tone": 4,
+   "hex": "#eadaba",
+   "L": 87.57,
+   "a": 0.46,
+   "b": 17.75,
+   "C": 17.76,
+   "h": 88.5,
+   "ita": 64.7,
+   "ita_class": "very light"
+  },
+  {
+   "tone": 5,
+   "hex": "#d7bd96",
+   "L": 77.9,
+   "a": 3.47,
+   "b": 23.14,
+   "C": 23.4,
+   "h": 81.5,
+   "ita": 50.3,
+   "ita_class": "light"
+  },
+  {
+   "tone": 6,
+   "hex": "#a07e56",
+   "L": 55.14,
+   "a": 7.79,
+   "b": 26.74,
+   "C": 27.85,
+   "h": 73.8,
+   "ita": 10.9,
+   "ita_class": "tan"
+  },
+  {
+   "tone": 7,
+   "hex": "#825c43",
+   "L": 42.47,
+   "a": 12.33,
+   "b": 20.53,
+   "C": 23.95,
+   "h": 59.0,
+   "ita": -20.1,
+   "ita_class": "brown"
+  },
+  {
+   "tone": 8,
+   "hex": "#604134",
+   "L": 30.68,
+   "a": 11.67,
+   "b": 13.34,
+   "C": 17.72,
+   "h": 48.8,
+   "ita": -55.4,
+   "ita_class": "dark"
+  },
+  {
+   "tone": 9,
+   "hex": "#3a312a",
+   "L": 21.07,
+   "a": 2.69,
+   "b": 5.97,
+   "C": 6.55,
+   "h": 65.7,
+   "ita": -78.3,
+   "ita_class": "dark"
+  },
+  {
+   "tone": 10,
+   "hex": "#292420",
+   "L": 14.61,
+   "a": 1.48,
+   "b": 3.53,
+   "C": 3.83,
+   "h": 67.2,
+   "ita": -84.3,
+   "ita_class": "dark"
+  }
+ ]
+}

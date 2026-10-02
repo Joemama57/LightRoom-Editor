@@ -95,6 +95,24 @@ end
 
 mods.LrApplication = { activeCatalog = function() return catalog end }
 
+-- Develop module: createNewMask appends an AI correction to the selected photo,
+-- like Lightroom does once the selection has computed.
+local view = { module = "library" }
+mods.LrApplicationView = { switchToModule = function(m) view.module = m end }
+mods.LrDevelopController = {
+  goToMasking = function() end,
+  createNewMask = function(kind, subtype)
+    assert(view.module == "develop", "createNewMask outside Develop")
+    local photo = catalog.active
+    local list = photo.settings.MaskGroupBasedCorrections or {}
+    if subtype == "nothing" then return nil end
+    list[#list + 1] = { What = "Correction", CorrectionMasks = { { MaskSubType = subtype } }, LocalTemperature = 0 }
+    photo.settings.MaskGroupBasedCorrections = list
+    return nil  -- like Lightroom: no id even on success
+  end,
+}
+function catalog:setSelectedPhotos(active, list) self.active = active; self.selected = list end
+
 mods.LrExportSession = function(args)
   local session = {}
   function session:renditions()
@@ -148,7 +166,8 @@ class PyHelpers:
         Path(path).write_text(text)
 
     def sleep(self, s):
-        time.sleep(s)
+        # Lightroom-side waits (mask polling, settling) don't need real time here.
+        time.sleep(min(s, 0.02))
         if self.stop_at and time.monotonic() > self.stop_at:
             self.bridge_module.stop()
 
@@ -312,3 +331,41 @@ def test_only_one_loop_runs_and_stop_file_ends_it(lua_env):
     assert seen == {"running": True, "second_returned": True}
     assert not (root / "stop").exists() and not (root / "heartbeat").exists()
     assert not bridge.isRunning()
+
+
+def test_get_settings_and_mask_adjust(lua_env):
+    lua, py, catalog, by_id = lua_env
+
+    def client_fn(c):
+        first = c.mask_adjust("12", "subject", {"LocalTemperature": -10, "LocalExposure2012": 0.3})
+        second = c.mask_adjust("12", "subject", {"LocalTemperature": -20, "LocalExposure2012": 0.3})
+        (settings,) = c.get_settings([{"id": "12"}])
+        return first, second, settings
+
+    first, second, settings = run_bridge_with_client(lua_env, client_fn)
+    assert first["created"] is True and first["found"] is True
+    assert second["created"] is False  # found again by name, not re-created
+    assert second["values"] == {"LocalTemperature": -20, "LocalExposure2012": 0.3}
+    (mask,) = settings["settings"]["MaskGroupBasedCorrections"]
+    assert mask["CorrectionName"] == "Match Look subject"
+    assert mask["LocalTemperature"] == pytest.approx(-0.2)  # stored as a fraction of -100..100
+    assert mask["LocalExposure2012"] == pytest.approx(0.3)  # stops, unscaled
+    # The user's selection is put back afterwards.
+    assert catalog.active.localIdentifier == 11
+
+
+def test_mask_adjust_reports_no_detection(lua_env):
+    from engine.bridge import BridgeError
+
+    def client_fn(c):
+        try:
+            c.mask_adjust("12", "objects", {"LocalTemperature": -10})
+        except BridgeError as e:
+            return str(e)
+
+    lua, py, *_ = lua_env
+    # Make the AI selection find nothing, as on a photo without a subject.
+    lua.execute("local m = import('LrDevelopController'); local orig = m.createNewMask; "
+                "m.createNewMask = function(k, s) return orig(k, 'nothing') end")
+    msg = run_bridge_with_client(lua_env, client_fn, seconds=10.0)
+    assert "didn't create a objects mask" in msg

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 from PIL import Image
 
+from . import skin as skin_model
 from .colorspace import srgb_to_lab
 
 PERCENTILES = (1, 25, 50, 75, 99)
@@ -13,7 +14,10 @@ CLIP_LOW = 0.01
 CLIP_HIGH = 0.99
 # Pixels used for the neutral estimate: mid-tones close to the frame's average cast.
 NEUTRAL_L_RANGE = (20.0, 85.0)
-NEUTRAL_MAX_CHROMA = 20.0
+NEUTRAL_RADII = (30.0, 20.0, 14.0)  # successive a*b* radii around the cast estimate
+# Tighter radii when we know roughly where the neutrals should be (the reference's
+# neutral axis): any remaining cast is small, and saturated content stays out.
+HINT_RADII = (15.0, 12.0, 10.0)
 MIN_NEUTRAL_FRACTION = 0.02
 
 
@@ -24,6 +28,10 @@ class Metrics:
     L: dict  # L* percentiles, keyed "p1", "p25", ...
     clipped_fraction: float
     neutral_fraction: float
+    skin_a: float = None  # membership-weighted mean Lab of skin-tone pixels (None when there are none)
+    skin_b: float = None
+    skin_fraction: float = 0.0
+    skin_L: float = None
 
     def to_dict(self):
         return asdict(self)
@@ -47,8 +55,14 @@ def _downsample(img):
     return img[::step, ::step]
 
 
-def measure(img):
-    """Measure an sRGB image (float in [0, 1] or uint8)."""
+def measure(img, neutral_hint=None):
+    """Measure an sRGB image (float in [0, 1] or uint8).
+
+    neutral_hint: (a*, b*) where this photo's neutrals are expected, normally
+    the reference's neutral axis. The search for near-gray pixels starts there,
+    so a frame dominated by one colour (foliage, a red wall) isn't mistaken
+    for a colour cast. Ignored if no gray-ish pixels are found near it.
+    """
     img = np.asarray(img)
     if img.dtype == np.uint8:
         img = img.astype(np.float64) / 255.0
@@ -63,18 +77,41 @@ def measure(img):
     usable = lab[~clipped]
     if len(usable) == 0:
         usable = lab
-    # Near-neutral = close to the frame's own average color, so a strong cast
-    # doesn't push every pixel out of the selection.
-    cast = usable[:, 1:].mean(axis=0)
-    chroma = np.hypot(usable[:, 1] - cast[0], usable[:, 2] - cast[1])
-    neutral = (
-        (usable[:, 0] >= NEUTRAL_L_RANGE[0])
-        & (usable[:, 0] <= NEUTRAL_L_RANGE[1])
-        & (chroma <= NEUTRAL_MAX_CHROMA)
-    )
+    # Near-neutral = close to the frame's own cast, so a strong cast doesn't push
+    # every pixel out of the selection. The cast is found by narrowing in on the
+    # largest low-chroma cluster (median, shrinking radius), so a big saturated
+    # area like foliage or a red wall drops out instead of dragging the estimate.
+    midtones = (usable[:, 0] >= NEUTRAL_L_RANGE[0]) & (usable[:, 0] <= NEUTRAL_L_RANGE[1])
+    cast = np.median(usable[midtones, 1:] if midtones.any() else usable[:, 1:], axis=0)
+    radii = NEUTRAL_RADII
+    if neutral_hint is not None:
+        hint = np.asarray(neutral_hint, dtype=float)
+        near = midtones & (np.hypot(usable[:, 1] - hint[0], usable[:, 2] - hint[1]) <= HINT_RADII[0])
+        if near.sum() >= MIN_NEUTRAL_FRACTION * len(img):
+            cast, radii = hint, HINT_RADII
+    neutral = midtones
+    for radius in radii:
+        dist = np.hypot(usable[:, 1] - cast[0], usable[:, 2] - cast[1])
+        candidate = midtones & (dist <= radius)
+        if candidate.sum() < MIN_NEUTRAL_FRACTION * len(img):
+            break
+        neutral = candidate
+        cast = np.median(usable[neutral, 1:], axis=0)
     neutral_fraction = float(neutral.sum()) / len(img)
     # Fall back to plain gray-world when the frame has almost no near-neutral pixels.
     pool = usable[neutral] if neutral_fraction >= MIN_NEUTRAL_FRACTION else usable
+
+    # Skin: membership from the measured skin-tone model (engine/skin.py). The
+    # mean is weighted by membership so pixels near the edge of the skin band
+    # fade in and out smoothly between renders instead of flipping.
+    w = skin_model.weights(usable)
+    skin = w >= skin_model.MIN_WEIGHT
+    skin_fraction = float(skin.sum()) / len(img)
+    if skin.any():
+        sw = w[skin] / w[skin].sum()
+        skin_L, skin_a, skin_b = (float(v) for v in sw @ usable[skin])
+    else:
+        skin_L = skin_a = skin_b = None
 
     return Metrics(
         a=float(np.mean(pool[:, 1])),
@@ -82,8 +119,12 @@ def measure(img):
         L=L,
         clipped_fraction=float(clipped.mean()),
         neutral_fraction=neutral_fraction,
+        skin_a=skin_a,
+        skin_b=skin_b,
+        skin_fraction=skin_fraction,
+        skin_L=skin_L,
     )
 
 
-def measure_file(path):
-    return measure(load_image(path))
+def measure_file(path, neutral_hint=None):
+    return measure(load_image(path), neutral_hint)

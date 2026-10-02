@@ -33,6 +33,9 @@ METRIC_KEYS = ["b", "a", "p1", "p25", "p50", "p75", "p99"]
 # Relative weight of each metric in the fit. Mid-tones and color matter most;
 # the extreme percentiles depend on scene content and are matched more loosely.
 METRIC_WEIGHTS = np.array([1.0, 1.0, 0.4, 0.8, 1.0, 0.8, 0.4])
+SKIN_WEIGHTS = np.array([0.5, 0.5])
+# Below this fraction of skin pixels the skin guard sits out for that photo.
+MIN_SKIN_FRACTION = 0.01
 
 # Typical step size per slider, used to put sliders on a comparable scale.
 # Temperature is handled in mireds for raw files (see _to_internal).
@@ -77,6 +80,27 @@ _PRIOR_JPEG[0, 0] = 0.30  # per unit of the -100..100 offset
 
 
 @dataclass
+class Options:
+    """How a match is solved.
+
+    prior: 7x7 sensitivities (rows METRIC_KEYS, cols CORRECTIVE, internal units)
+        measured by `engine.calibrate` for this file type; None uses the built-in guess.
+    skin: also match skin tones (when both photos have enough skin pixels).
+    color_only: solve white balance only and leave each photo's exposure and
+        tone sliders as they are ("keep each photo's own exposure intent").
+    """
+
+    prior: np.ndarray = None
+    skin: bool = False
+    color_only: bool = False
+    # How far white balance may move from the starting point: (Temperature
+    # radius, Tint radius). Temperature is in mireds for raw files and in
+    # offset units for JPEGs. Keeps a frame dominated by one colour (foliage,
+    # a red wall) from dragging the white balance somewhere absurd.
+    wb_limits: tuple = (None, 40.0)
+
+
+@dataclass
 class Proposal:
     sliders: dict
     done: bool
@@ -109,29 +133,50 @@ def _to_sliders(x, is_raw):
     return out
 
 
+def _as_metrics(m):
+    return Metrics.from_dict(m) if isinstance(m, dict) else m
+
+
+def _has_skin(m):
+    m = _as_metrics(m)
+    return m.skin_a is not None and m.skin_fraction >= MIN_SKIN_FRACTION
+
+
 def _metric_vector(m):
-    if isinstance(m, dict):
-        m = Metrics.from_dict(m)
+    m = _as_metrics(m)
     return np.array([m.b, m.a] + [m.L[k] for k in METRIC_KEYS[2:]])
 
 
-def match_error(ref, target):
+def match_error(ref, target, skin=False, color_only=False):
     """One number for how far a render is from the reference (roughly ΔE00 units).
 
     Combines the color difference of the neutral axis (measured at mid-gray) with
-    a weighted RMS of the L* percentile differences.
+    a weighted RMS of the L* percentile differences. With `skin`, the skin-tone
+    color difference is averaged in with the neutral one (when both photos have
+    skin). With `color_only`, tone is ignored.
     """
-    r = _metric_vector(ref)
-    t = _metric_vector(target)
-    color = float(delta_e_2000([50.0, r[1], r[0]], [50.0, t[1], t[0]]))
+    r = _as_metrics(ref)
+    t = _as_metrics(target)
+    color = float(delta_e_2000([50.0, r.a, r.b], [50.0, t.a, t.b]))
+    if skin and _has_skin(r) and _has_skin(t):
+        skin_de = float(delta_e_2000([60.0, r.skin_a, r.skin_b], [60.0, t.skin_a, t.skin_b]))
+        color = float(np.sqrt((color**2 + skin_de**2) / 2))
+    if color_only:
+        return color
+    rv, tv = _metric_vector(r), _metric_vector(t)
     w = METRIC_WEIGHTS[2:]
-    tone = float(np.sqrt(np.sum(w * (t[2:] - r[2:]) ** 2) / np.sum(w)))
+    tone = float(np.sqrt(np.sum(w * (tv[2:] - rv[2:]) ** 2) / np.sum(w)))
     return float(np.hypot(color, tone))
 
 
-def _jacobian(history_x, history_m, is_raw):
+def default_prior(is_raw):
+    return (_PRIOR_RAW if is_raw else _PRIOR_JPEG).copy()
+
+
+def _jacobian(history_x, history_m, is_raw, prior=None):
     """Prior sensitivities refined by a Broyden update for every step seen so far."""
-    J = (_PRIOR_RAW if is_raw else _PRIOR_JPEG) * SLIDER_SCALE  # per scaled unit
+    base = default_prior(is_raw) if prior is None else np.asarray(prior, dtype=float)
+    J = base * SLIDER_SCALE  # per scaled unit
     for i in range(1, len(history_x)):
         du = (history_x[i] - history_x[i - 1]) / SLIDER_SCALE
         dm = history_m[i] - history_m[i - 1]
@@ -142,7 +187,7 @@ def _jacobian(history_x, history_m, is_raw):
     return J
 
 
-def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, damping=0.05):
+def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, damping=0.05, options=None):
     """Return the next sliders to render, or the best ones found if done.
 
     ref: reference Metrics (or dict).
@@ -151,13 +196,15 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
         reference's corrective values).
     anchor: multiplier on ANCHOR, the pull toward the starting sliders.
     damping: Levenberg-Marquardt style step damping.
+    options: Options (calibrated prior, skin guard, color-only).
     """
     if not history:
         raise ValueError("history needs at least one render")
+    opts = options or Options()
     target = _metric_vector(ref)
     xs = [_to_internal(h["sliders"], is_raw) for h in history]
     ms = [_metric_vector(h["metrics"]) for h in history]
-    errors = [match_error(ref, h["metrics"]) for h in history]
+    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only) for h in history]
     best = int(np.argmin(errors))
 
     iterations = len(history) - 1
@@ -181,14 +228,32 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
             iterations=iterations,
         )
 
-    J = _jacobian(xs, ms, is_raw)
+    J = _jacobian(xs, ms, is_raw, opts.prior)
     diff = ms[-1] - target
+    weights = METRIC_WEIGHTS.copy()
     # Fix the light first (white balance + exposure against color and mid-tones);
-    # only once that's close do the tone sliders get to shape the rest.
+    # only once that's close do the tone sliders (and the skin guard) join in.
     light_error = float(np.hypot(np.hypot(diff[0], diff[1]), diff[4]))
-    active = LIGHT if light_error > LIGHT_SETTLED else list(range(len(CORRECTIVE)))
+    settled = light_error <= LIGHT_SETTLED
+    if opts.color_only:
+        # White balance only; tone metrics don't pull on anything.
+        active = [0, 1]
+        weights[2:] = 0.0
+        settled = float(np.hypot(diff[0], diff[1])) <= LIGHT_SETTLED
+    else:
+        active = list(range(len(CORRECTIVE))) if settled else LIGHT
 
-    W = np.diag(np.sqrt(METRIC_WEIGHTS))
+    # Skin guard: once the light is close, also pull skin tones toward the
+    # reference's. Skin pixels are picked by color, so under a strong cast the
+    # selection is unreliable; that's why it waits. Skin answers white balance
+    # the way the neutral axis does, so it borrows those sensitivity rows.
+    if opts.skin and settled and _has_skin(ref) and _has_skin(history[-1]["metrics"]):
+        r_m, t_m = _as_metrics(ref), _as_metrics(history[-1]["metrics"])
+        diff = np.concatenate([diff, [t_m.skin_b - r_m.skin_b, t_m.skin_a - r_m.skin_a]])
+        J = np.vstack([J, J[[0, 1]]])
+        weights = np.concatenate([weights, SKIN_WEIGHTS])
+
+    W = np.diag(np.sqrt(weights))
     r = W @ diff
     A = (W @ J)[:, active]
     u_cur = xs[-1] / SLIDER_SCALE
@@ -202,6 +267,7 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     # Cap the step so one bad sensitivity estimate can't fling a slider across its range.
     du = np.clip(du, -4.0, 4.0)
     x_next = (u_cur + du) * SLIDER_SCALE
+    x_next = _limit_white_balance(x_next, xs[0], opts.wb_limits)
 
     return Proposal(
         sliders=_to_sliders(x_next, is_raw),
@@ -210,6 +276,25 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
         best_residual=errors[best],
         iterations=iterations,
     )
+
+
+def _limit_white_balance(x, x_start, limits):
+    temp_radius, tint_radius = limits
+    x = x.copy()
+    if temp_radius is not None:
+        x[0] = np.clip(x[0], x_start[0] - temp_radius, x_start[0] + temp_radius)
+    if tint_radius is not None:
+        x[1] = np.clip(x[1], x_start[1] - tint_radius, x_start[1] + tint_radius)
+    return x
+
+
+def wb_limits(is_raw, wb_from_camera):
+    """Default white-balance limits. Starting from the camera's own white
+    balance, a match needs only the reference's creative offset plus a small
+    correction; starting from the reference's values, the light may differ a lot."""
+    if wb_from_camera:
+        return (80.0 if is_raw else 30.0, 30.0)
+    return (None, 40.0)
 
 
 def blend(start, best, strength, is_raw):

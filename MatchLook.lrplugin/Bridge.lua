@@ -6,6 +6,8 @@ and gets a reply in outbox/<id>.json:
 ]]
 
 local LrApplication = import "LrApplication"
+local LrApplicationView = import "LrApplicationView"
+local LrDevelopController = import "LrDevelopController"
 local LrExportSession = import "LrExportSession"
 local LrFileUtils = import "LrFileUtils"
 local LrPathUtils = import "LrPathUtils"
@@ -204,6 +206,148 @@ function commands.render(params)
 		out[#out + 1] = dest
 	end
 	return out
+end
+
+function commands.get_settings(params)
+	local out = {}
+	eachItem(params, function(photo, item)
+		out[#out + 1] = { id = item.id, settings = photo:getDevelopSettings() }
+	end)
+	return out
+end
+
+-- Experimental: AI masks ---------------------------------------------------------
+--
+-- Creating an AI mask (Select Subject / Sky / ...) is only possible through
+-- LrDevelopController, which drives the Develop module on screen: the photo has
+-- to be selected and Develop open. The approach and its workarounds follow
+-- par4987/lightroom-mcp's HandlerAIMasks.lua (MIT, Copyright (c) 2026 Marcin
+-- Skalski), which found that:
+--   * createNewMask can return nil while the AI selection is still computing,
+--     so success is detected by polling for the new correction;
+--   * a catalog write fails after the many yields of that sequence, so the
+--     mask's sliders are written from a fresh task;
+--   * local sliders are stored as a fraction of their -100..100 range, except
+--     LocalExposure2012, which is in stops.
+-- Our correction is found again later by its CorrectionName.
+
+local MASK_KINDS = { subject = true, sky = true, background = true, people = true, objects = true, landscape = true }
+local MASK_POLL_ATTEMPTS = 10
+local MASK_POLL_SECONDS = 1.5
+
+local function corrections(photo)
+	local value = photo:getDevelopSettings().MaskGroupBasedCorrections
+	return type(value) == "table" and value or {}
+end
+
+local function findCorrection(list, name)
+	for i, c in ipairs(list) do
+		if type(c) == "table" and c.CorrectionName == name then
+			return i, c
+		end
+	end
+	return nil
+end
+
+local function writeInFreshTask(fn)
+	local done, ok, err = false, false, nil
+	LrTasks.startAsyncTask(function()
+		ok, err = LrTasks.pcall(fn)
+		done = true
+	end)
+	for _ = 1, 200 do
+		if done then
+			break
+		end
+		LrTasks.sleep(0.05)
+	end
+	if not done then
+		error("mask write did not finish within 10 s")
+	end
+	if not ok then
+		error(err)
+	end
+end
+
+function commands.mask_adjust(params)
+	local kind = params.kind
+	if not MASK_KINDS[kind] then
+		error("unknown mask kind " .. tostring(kind))
+	end
+	local catalog = LrApplication.activeCatalog()
+	local photo = findPhoto(params.id)
+	local name = "Match Look " .. kind
+	local index = findCorrection(corrections(photo), name)
+	local created = false
+
+	if not index then
+		-- Remember the selection so it can be put back afterwards.
+		local previousActive = catalog:getTargetPhoto()
+		local previousSelection = catalog:getTargetPhotos()
+
+		LrApplicationView.switchToModule("develop")
+		LrTasks.sleep(0.5)
+		catalog:setSelectedPhotos(photo, { photo })
+		LrTasks.sleep(0.3)
+		LrTasks.pcall(function()
+			LrDevelopController.goToMasking()
+		end)
+		LrTasks.sleep(1.0)
+
+		local before = #corrections(photo)
+		local ok, err = LrTasks.pcall(function()
+			return LrDevelopController.createNewMask("aiSelection", kind)
+		end)
+		if not ok then
+			error("createNewMask failed (this Lightroom version may not support it): " .. tostring(err))
+		end
+		for _ = 1, MASK_POLL_ATTEMPTS do
+			local n = #corrections(photo)
+			if n > before then
+				index = n
+				created = true
+				break
+			end
+			LrTasks.sleep(MASK_POLL_SECONDS)
+		end
+
+		if previousActive then
+			LrTasks.pcall(function()
+				catalog:setSelectedPhotos(previousActive, previousSelection)
+			end)
+		end
+		if not index then
+			error("Lightroom didn't create a " .. kind .. " mask (nothing detected, or AI masking unavailable)")
+		end
+	end
+
+	writeInFreshTask(function()
+		catalog:withWriteAccessDo("Match Look mask", function()
+			local list = corrections(photo)
+			local c = list[index]
+			if type(c) ~= "table" then
+				error("the new mask's correction disappeared")
+			end
+			c.CorrectionName = name
+			for key, value in pairs(params.values or {}) do
+				c[key] = (key == "LocalExposure2012") and value or value / 100
+			end
+			photo:applyDevelopSettings(
+				{ EnableMaskGroupBasedCorrections = true, MaskGroupBasedCorrections = list },
+				"Match Look mask"
+			)
+		end, WRITE_TIMEOUT)
+	end)
+
+	local _, ours = findCorrection(corrections(photo), name)
+	local values = {}
+	if ours then
+		for key in pairs(params.values or {}) do
+			local v = ours[key]
+			values[key] = (type(v) == "number" and key ~= "LocalExposure2012") and v * 100 or v
+		end
+	end
+	return { created = created, found = ours ~= nil, values = values }
 end
 
 function commands.snapshot(params)

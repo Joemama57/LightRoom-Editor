@@ -72,9 +72,10 @@ def run_loop(ref_metrics, raw, start_sliders, is_raw=True, **kwargs):
     from engine.measure import measure
     from engine.solver import propose
 
-    history = [{"sliders": start_sliders, "metrics": measure(render(raw, start_sliders)).to_dict()}]
+    hint = (ref_metrics.a, ref_metrics.b)
+    history = [{"sliders": start_sliders, "metrics": measure(render(raw, start_sliders), hint).to_dict()}]
     while True:
         p = propose(ref_metrics, history, is_raw=is_raw, **kwargs)
         if p.done:
             return p, history
-        history.append({"sliders": p.sliders, "metrics": measure(render(raw, p.sliders)).to_dict()})
+        history.append({"sliders": p.sliders, "metrics": measure(render(raw, p.sliders), hint).to_dict()})

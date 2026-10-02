@@ -65,10 +65,21 @@ def test_split_keeps_look_and_drops_per_photo_settings():
 
 def test_starting_corrective_across_file_types():
     raw_ref = {"Temperature": 5200, "Tint": 4, "Exposure2012": 0.3}
-    assert starting_corrective(raw_ref, True, True)["Temperature"] == 5200
-    jpeg = starting_corrective(raw_ref, True, False)
+    assert starting_corrective(raw_ref, True, True)[0]["Temperature"] == 5200
+    jpeg, from_camera = starting_corrective(raw_ref, True, False)
     assert jpeg["Temperature"] == 0 and jpeg["Tint"] == 0 and jpeg["Exposure2012"] == 0.3
-    assert starting_corrective({"Temperature": 10}, False, True)["Temperature"] == 5500
+    assert not from_camera
+    assert starting_corrective({"Temperature": 10}, False, True)[0]["Temperature"] == 5500
+
+
+def test_starting_white_balance_comes_from_the_camera_when_as_shot():
+    raw_ref = {"Temperature": 5200, "Tint": 4, "Exposure2012": 0.3}
+    start, from_camera = starting_corrective(
+        raw_ref, True, True, {"WhiteBalance": "As Shot", "Temperature": 3100, "Tint": 7})
+    assert from_camera and start["Temperature"] == 3100 and start["Tint"] == 7
+    assert start["Exposure2012"] == 0.3  # tone still starts from the reference
+    _, from_camera = starting_corrective(raw_ref, True, True, {"WhiteBalance": "Custom", "Temperature": 3100})
+    assert not from_camera
 
 
 def test_match_end_to_end(lightroom, tmp_path):
@@ -173,3 +184,127 @@ def test_every_real_lightroom_key_is_classified():
               "PerspectiveUpright", "UprightVersion", "Sharpness", "LuminanceSmoothing", "WhiteBalance",
               "AutoExposure", "LensBlur", "VignetteAmount", "EnableTransform"):
         assert k not in creative and k not in corrective, k
+
+
+# -- options, self-learning, calibration, masks ---------------------------------
+
+from engine.learning import Learner  # noqa: E402
+from engine.workflow import learn_from_run, run_calibrate  # noqa: E402
+
+
+def quiet(_):
+    pass
+
+
+def test_camera_white_balance_start_converges_faster(lightroom, tmp_path):
+    plain = run_match(lightroom, tmp_path / "a", log=quiet)
+    # Same photos, but Lightroom still has the camera's As Shot white balance (a bit off, like real AWB).
+    for pid, kelvin, tint in (("tung", 3200, 0), ("shade", 7500, 5), ("under", 5500, 0)):
+        lightroom.photos[pid]["settings"] = {"WhiteBalance": "As Shot", "Temperature": kelvin * 1.05, "Tint": tint + 2}
+    as_shot = run_match(lightroom, tmp_path / "b", log=quiet)
+    assert all(p["wb_from_camera"] for p in as_shot["photos"])
+    assert sum(p["iterations"] for p in as_shot["photos"]) < sum(p["iterations"] for p in plain["photos"])
+    assert all(p["final_error"] < 2.0 for p in as_shot["photos"])
+
+
+def test_color_only_keeps_each_photos_exposure(lightroom, tmp_path):
+    lightroom.photos["under"]["settings"]["Exposure2012"] = -0.4  # a deliberately dark frame
+    report = run_match(lightroom, tmp_path, color_only=True, log=quiet)
+    under = next(p for p in report["photos"] if p["id"] == "under")
+    assert under["final"]["Exposure2012"] == -0.4
+    assert under["final"]["Shadows2012"] == 0.0  # its own value, not the reference's 20
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    assert tung["final"]["Temperature"] == pytest.approx(3200, rel=0.08)
+    assert report["options"]["color_only"]
+
+
+def test_skin_is_described_in_the_report(tmp_path):
+    def portrait(seed):
+        s = make_scene(seed=seed)
+        s[10:50, 30:70] = (0.42, 0.24, 0.16)
+        return s
+
+    lr = FakeLightroom({
+        "ref": photo(capture(portrait(0), 5500), "P1.ARW", settings=dict(REF_SETTINGS)),
+        "t": photo(capture(portrait(1)[4:, 2:], 3200), "P2.ARW"),
+    }, active="ref")
+    report = run_match(lr, tmp_path, skin=True, log=quiet)
+    assert report["reference"]["skin"]["hue_note"] == "within the typical range for skin"
+    (t,) = report["photos"]
+    assert t["skin"]["ita_class"] and 1 <= t["skin"]["monk_tone"] <= 10
+    assert t["skin_vs_reference"] == "matches the reference"
+    assert t["final_error"] < 2.0
+
+
+def test_self_learning_across_runs(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    runs = tmp_path / "runs"
+    first = run_match(lightroom, runs / "1", learner=learner, log=quiet)
+    assert learner.data["runs"] == 1
+    assert all(p["learned_sensitivities"] is None for p in first["photos"])  # nothing learned yet
+
+    run_match(lightroom, runs / "2", learner=learner, log=quiet)
+    third = run_match(lightroom, runs / "3", learner=learner, log=quiet)
+    assert all(p["learned_sensitivities"] == "raw|Sony A7 IV" for p in third["photos"])
+    assert all(p["final_error"] < 2.0 for p in third["photos"])
+
+
+def test_learns_your_edits_and_applies_them_next_time(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    runs = tmp_path / "runs"
+    def run(n):
+        # Each match first learns from your edits to the previous run's photos.
+        return run_match(lightroom, runs / f"{n:02d}", learner=learner, log=quiet)
+
+    for n in range(2):
+        report = run(n)
+        # After each match you warm the tungsten shot by 250 K in Lightroom.
+        tung = next(p for p in report["photos"] if p["id"] == "tung")
+        assert tung["learned_adjustment"] is None  # one edit isn't a habit yet
+        lightroom.photos["tung"]["settings"]["Temperature"] = tung["matched"]["Temperature"] + 250
+
+    report = run(2)  # learns from run 1's edit first (that's two), then applies it
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    # Applied with less than full confidence after two edits, but clearly warmer.
+    assert 100 < tung["learned_adjustment"]["Temperature"] <= 250
+    assert tung["final"]["Temperature"] > tung["matched"]["Temperature"]
+    # Only the warm-light photo: daylight/cool photos had no edits.
+    others = [p for p in report["photos"] if p["id"] != "tung"]
+    assert all(p["learned_adjustment"] is None for p in others)
+    assert "warm light" in " ".join(learner.summary()["preferences"])
+
+
+def test_learn_from_run_once(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    report = run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    lightroom.photos["tung"]["settings"]["Tint"] = tung["matched"]["Tint"] + 6
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 1
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 0  # already learned
+
+
+def test_calibrate_learns_and_restores_every_photo(lightroom, tmp_path):
+    before = {pid: dict(p["settings"]) for pid, p in lightroom.photos.items()}
+    learner = Learner(tmp_path / "learning.json")
+    result = run_calibrate(lightroom, tmp_path / "cal", learner, log=quiet)
+    assert result["photos"] == 4 and result["observations"] == 4 * 7
+    for pid, settings in before.items():
+        after = lightroom.photos[pid]["settings"]
+        for key in ("Temperature", "Tint", "Exposure2012", "Shadows2012"):
+            assert after.get(key) == settings.get(key, after.get(key)), (pid, key)
+    assert learner.prior("Sony A7 IV", True)[0] is not None
+    assert any(name == "Before Match Look calibration" for _, name, _ in lightroom.snapshots)
+
+
+def test_nudge_inside_a_mask(lightroom, tmp_path):
+    run_match(lightroom, tmp_path, log=quiet)
+    p = run_nudge(lightroom, tmp_path, "DSC0002", parse_changes(["Temperature=-10", "Exposure2012=+0.2"], allow_mask=True),
+                  mask="subject")
+    assert p["masks"]["subject"] == {"LocalTemperature": -10.0, "LocalExposure2012": 0.2}
+    p = run_nudge(lightroom, tmp_path, "DSC0002", parse_changes(["Temperature=-5"], allow_mask=True), mask="subject")
+    assert p["masks"]["subject"]["LocalTemperature"] == -15.0  # relative changes add up
+    assert [c[1] for c in lightroom.mask_calls] == ["subject", "subject"]
+    (mask,) = lightroom.photos["tung"]["settings"]["MaskGroupBasedCorrections"]
+    assert mask["LocalTemperature"] == pytest.approx(-0.15)
+    with pytest.raises(ValueError):
+        run_nudge(lightroom, tmp_path, "DSC0002", {"Saturation": 10.0})  # local-only slider without a mask

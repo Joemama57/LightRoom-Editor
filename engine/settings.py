@@ -86,8 +86,27 @@ def is_raw(photo):
     return photo.get("fileFormat") in RAW_FORMATS
 
 
-def starting_corrective(ref_corrective, ref_is_raw, target_is_raw):
-    """The reference's corrective sliders, made valid for the target's file type.
+def camera_white_balance(settings, target_is_raw):
+    """The camera's own white balance for this photo, if Lightroom still has it.
+
+    A raw photo left on "As Shot" carries the camera's estimate of the scene's
+    light in Temperature/Tint. That's a far better starting point than the
+    reference's values when the light differs (tungsten vs daylight), and it
+    isn't fooled by frame content the way an average-colour estimate is.
+    """
+    if not target_is_raw or not settings or settings.get("WhiteBalance") != "As Shot":
+        return None
+    temp, tint = settings.get("Temperature"), settings.get("Tint")
+    if not temp or tint is None:
+        return None
+    return {"Temperature": float(temp), "Tint": float(tint)}
+
+
+def starting_corrective(ref_corrective, ref_is_raw, target_is_raw, target_settings=None):
+    """Starting sliders for a target: the reference's, made valid for the
+    target's file type, with the camera's own white balance when available.
+
+    Returns (sliders, wb_from_camera).
 
     Raw files take Temperature in Kelvin; JPEG/TIFF take a -100..100 offset, so
     a Kelvin value can't carry across. The solver finds the right value anyway.
@@ -98,4 +117,7 @@ def starting_corrective(ref_corrective, ref_is_raw, target_is_raw):
         start["Tint"] = 0.0
     elif target_is_raw and start["Temperature"] == 0.0:
         start["Temperature"] = 5500.0
-    return start
+    camera = camera_white_balance(target_settings, target_is_raw)
+    if camera:
+        start.update(camera)
+    return start, camera is not None
