@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m engine.bridge:*)",
+      "Bash(python3 -m engine.workflow:*)",
+      "Bash(.venv/bin/python -m engine.bridge:*)",
+      "Bash(.venv/bin/python -m engine.workflow:*)",
+      "Read(~/.matchlook/**)"
+    ]
+  }
+}

@@ -210,3 +210,19 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
         best_residual=errors[best],
         iterations=iterations,
     )
+
+
+def blend(start, best, strength, is_raw):
+    """Move `strength` (0..1) of the way from the starting sliders to the solved ones.
+
+    Temperature is blended in mireds for raw files, so 50% sits halfway in how
+    the shift looks rather than halfway in Kelvin.
+    """
+    x0 = _to_internal(start, is_raw)
+    x1 = _to_internal(best, is_raw)
+    return _to_sliders(x0 + strength * (x1 - x0), is_raw)
+
+
+def clamp(sliders, is_raw):
+    """Round and clamp sliders to Lightroom's ranges."""
+    return _to_sliders(_to_internal(sliders, is_raw), is_raw)

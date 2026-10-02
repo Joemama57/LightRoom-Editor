@@ -1,2 +1,3 @@
 -r requirements.txt
 pytest>=7.0
+lupa>=2.0  # runs the Lightroom plugin's Lua in tests
