@@ -63,9 +63,11 @@ local function makePhoto(id, name, fmt, settings)
     for k, v in pairs(self.settings) do copy[k] = v end
     return copy
   end
-  function p:applyDevelopSettings(s)
+  function p:applyDevelopSettings(s, historyName)
     assert(py.in_write_access(), "applyDevelopSettings outside write access")
-    for k, v in pairs(s) do self.settings[k] = v end
+    self.historyName = historyName
+    -- Like Lightroom, silently ignore a value it doesn't accept.
+    for k, v in pairs(s) do if v ~= "Bogus" then self.settings[k] = v end end
   end
   function p:createDevelopSnapshot(n, update) table.insert(self.snapshots, n) end
   function p:setRawMetadata(k, v)
@@ -243,7 +245,8 @@ def test_bridge_commands_end_to_end(lua_env, tmp_path):
     b = by_id[12]
     assert b.settings.Temperature == 12.5 and b.settings.WhiteBalance == "Custom"
     assert list(b.settings.ToneCurvePV2012.values()) == [0, 5, 255, 250]
-    assert r["apply"] == {"applied": 1}
+    assert r["apply"] == {"applied": 1, "not_taken": {}}  # empty Lua table encodes as {}
+    assert b.historyName == "Match Look"
 
     assert r["render"] == [str(renders / "a.jpg"), str(renders / "sub" / "b.jpg")]
     assert (renders / "sub" / "b.jpg").read_text() == "jpeg-bytes-12"
@@ -278,3 +281,34 @@ def test_no_selection_returns_no_photos(lua_env):
     sel = run_bridge_with_client(lua_env, lambda c: c.get_selection())
     assert sel.get("active") is None
     assert sel["photos"] in ({}, [])
+
+
+def test_apply_reports_settings_lightroom_ignored(lua_env):
+    def client_fn(c):
+        return c.apply_settings([{"id": "11", "settings": {"CameraProfile": "Bogus", "Exposure2012": 0.5}}])
+
+    r = run_bridge_with_client(lua_env, client_fn)
+    assert r["applied"] == 1
+    assert r["not_taken"] == [{"id": "11", "key": "CameraProfile", "wanted": "Bogus", "got": "Adobe Standard"}]
+
+
+def test_only_one_loop_runs_and_stop_file_ends_it(lua_env):
+    lua, py, *_ = lua_env
+    bridge = lua.require("Bridge")
+    if isinstance(bridge, tuple):
+        bridge = bridge[0]
+    root = Path(py.home) / ".matchlook" / "bridge"
+    seen = {}
+
+    def sleep(s):
+        # While the first loop runs: it reports running, and a second run() returns at once.
+        seen["running"] = bridge.isRunning()
+        bridge.run()  # must not start a nested loop
+        seen["second_returned"] = True
+        (root / "stop").write_text("stop")  # what Shutdown.lua does from another script
+
+    py.sleep = sleep
+    bridge.run()
+    assert seen == {"running": True, "second_returned": True}
+    assert not (root / "stop").exists() and not (root / "heartbeat").exists()
+    assert not bridge.isRunning()

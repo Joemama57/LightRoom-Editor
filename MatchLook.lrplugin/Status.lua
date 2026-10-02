@@ -6,7 +6,7 @@ LrTasks.startAsyncTask(function()
 	if Bridge.isRunning() then
 		LrDialogs.message(
 			"Match Look Bridge is running",
-			"Requests handled: " .. Bridge.handled .. "\nFolder: " .. Bridge.root
+			"Folder: " .. Bridge.root
 				.. "\n\nIn Claude Code, select the photos (graded one active) and run /match-look."
 		)
 	else

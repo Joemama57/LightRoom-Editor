@@ -27,6 +27,10 @@ local inbox = LrPathUtils.child(Bridge.root, "inbox")
 local outbox = LrPathUtils.child(Bridge.root, "outbox")
 local renderDir = LrPathUtils.child(Bridge.root, "renders")
 
+local heartbeatPath = LrPathUtils.child(Bridge.root, "heartbeat")
+local stopPath = LrPathUtils.child(Bridge.root, "stop")
+local HEARTBEAT_SECONDS = 2
+local STALE_SECONDS = 6
 local running = false
 local stopRequested = false
 -- Photos seen in the last get_selection, as a fallback for catalog lookups.
@@ -103,15 +107,47 @@ function commands.get_selection()
 	return { active = active and photoId(active) or nil, photos = photos }
 end
 
+-- Lightroom silently ignores settings it doesn't accept (seen with malformed
+-- CameraProfile values in LrC-AVG's tests on LrC 15.5.1), so read every write
+-- back and report scalar values that didn't take.
+local function notTaken(wanted, got)
+	local missed = {}
+	for key, value in pairs(wanted) do
+		local actual = got[key]
+		local ok
+		if type(value) == "number" then
+			ok = type(actual) == "number" and math.abs(actual - value) <= 0.011
+		elseif type(value) == "table" then
+			ok = true -- curves and nested looks: not compared
+		else
+			ok = actual == value
+		end
+		if not ok then
+			missed[#missed + 1] = { key = key, wanted = value, got = actual }
+		end
+	end
+	return missed
+end
+
 function commands.apply_settings(params)
-	local n = 0
-	LrApplication.activeCatalog():withWriteAccessDo("Match Look", function()
+	local catalog = LrApplication.activeCatalog()
+	local applied = {}
+	catalog:withWriteAccessDo("Match Look", function()
 		eachItem(params, function(photo, item)
-			photo:applyDevelopSettings(item.settings)
-			n = n + 1
+			-- The second argument names the step in the History panel.
+			photo:applyDevelopSettings(item.settings, params.history_name or "Match Look")
+			applied[#applied + 1] = { photo = photo, item = item }
 		end)
 	end, WRITE_TIMEOUT)
-	return { applied = n }
+
+	local notTakenList = {}
+	for _, entry in ipairs(applied) do
+		for _, miss in ipairs(notTaken(entry.item.settings, entry.photo:getDevelopSettings())) do
+			miss.id = entry.item.id
+			notTakenList[#notTakenList + 1] = miss
+		end
+	end
+	return { applied = #applied, not_taken = notTakenList }
 end
 
 function commands.render(params)
@@ -230,15 +266,31 @@ local function handle(path)
 	Bridge.handled = Bridge.handled + 1
 end
 
+local function heartbeatAge()
+	local ok, text = pcall(readFile, heartbeatPath)
+	local stamp = ok and tonumber(text)
+	return stamp and (os.time() - stamp) or math.huge
+end
+
 function Bridge.run()
-	if running then
+	-- Another loop (e.g. from a menu script with its own copy of this module)
+	-- is already serving the inbox: never run two.
+	if running or heartbeatAge() < STALE_SECONDS then
 		return
 	end
 	running, stopRequested = true, false
 	LrFileUtils.createAllDirectories(inbox)
 	LrFileUtils.createAllDirectories(outbox)
+	if LrFileUtils.exists(stopPath) then
+		LrFileUtils.delete(stopPath)
+	end
 
-	while not stopRequested do
+	local lastBeat = 0
+	while not stopRequested and not LrFileUtils.exists(stopPath) do
+		if os.time() - lastBeat >= HEARTBEAT_SECONDS then
+			lastBeat = os.time()
+			writeAtomic(heartbeatPath, tostring(lastBeat))
+		end
 		local requests = {}
 		for path in LrFileUtils.files(inbox) do
 			if LrPathUtils.extension(path) == "json" then
@@ -255,14 +307,25 @@ function Bridge.run()
 		LrTasks.sleep(POLL_SECONDS)
 	end
 	running = false
+	if LrFileUtils.exists(stopPath) then
+		LrFileUtils.delete(stopPath)
+	end
+	if LrFileUtils.exists(heartbeatPath) then
+		LrFileUtils.delete(heartbeatPath)
+	end
 end
 
+-- A stop file on disk reaches the loop even when it runs in another copy of this module.
 function Bridge.stop()
 	stopRequested = true
+	if running or Bridge.isRunning() then
+		writeAtomic(stopPath, "stop")
+	end
 end
 
+-- Read from disk so any script can tell, whichever copy of the module runs the loop.
 function Bridge.isRunning()
-	return running
+	return heartbeatAge() < STALE_SECONDS
 end
 
 return Bridge

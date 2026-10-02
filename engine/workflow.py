@@ -35,6 +35,17 @@ def _corrective_settings(sliders):
     return dict(sliders, WhiteBalance="Custom")
 
 
+def _apply(bridge, items, warnings, log):
+    """Apply settings and record any value Lightroom didn't take."""
+    result = bridge.apply_settings(items) or {}
+    for miss in result.get("not_taken") or []:
+        msg = f"Lightroom didn't take {miss['key']}={miss.get('wanted')!r} on photo {miss['id']} (has {miss.get('got')!r})"
+        if msg not in warnings:
+            warnings.append(msg)
+            log(f"Warning: {msg}")
+    return result
+
+
 def run_match(
     bridge,
     out_dir,
@@ -66,8 +77,10 @@ def run_match(
     bridge.render([{"id": ref_id, "path": str(ref_path)}], size=size)
     ref_metrics = measure_file(ref_path)
 
+    warnings = []
     snap = bridge.snapshot([{"id": t["id"], "name": SNAPSHOT_NAME} for t in targets]) or {}
     if snap.get("warning"):
+        warnings.append(snap["warning"])
         log(f"Warning: {snap['warning']}")
 
     state = {}
@@ -82,8 +95,11 @@ def run_match(
         state[t["id"]] = {"photo": t, "is_raw": t_raw, "start": start, "sliders": start,
                           "history": [], "done": False, "extra_flags": flags}
 
-    bridge.apply_settings(
-        [{"id": pid, "settings": {**creative, **_corrective_settings(s["start"])}} for pid, s in state.items()]
+    _apply(
+        bridge,
+        [{"id": pid, "settings": {**creative, **_corrective_settings(s["start"])}} for pid, s in state.items()],
+        warnings,
+        log,
     )
 
     iteration = 0
@@ -112,7 +128,7 @@ def run_match(
                 updates.append({"id": item["id"], "settings": _corrective_settings(p.sliders)})
         log(f"Pass {iteration + 1}: {len(pending) - len(updates)} done, {len(updates)} still converging")
         if updates:
-            bridge.apply_settings(updates)
+            _apply(bridge, updates, warnings, log)
         iteration += 1
 
     # Final values: best render found, scaled by strength.
@@ -131,7 +147,7 @@ def run_match(
             s["flags"] = flags_for(s["last_metrics"], p, tolerance)
         else:
             rerender.append(pid)
-    bridge.apply_settings(finals)
+    _apply(bridge, finals, warnings, log)
 
     if rerender:
         final_dir = out_dir / "final"
@@ -153,7 +169,7 @@ def run_match(
         "tolerance": tolerance,
         "size": size,
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
-        "warnings": [snap["warning"]] if snap.get("warning") else [],
+        "warnings": warnings,
         "reference": {"id": ref_id, "fileName": ref["fileName"], "preview": str(ref_path),
                       "metrics": ref_metrics.to_dict()},
         "photos": [
@@ -239,7 +255,8 @@ def run_nudge(bridge, run_dir, photo, changes, label="yellow"):
     for key, delta in changes.items():
         sliders[key] = sliders.get(key, 0.0) + delta
     sliders = clamp(sliders, p["is_raw"])
-    bridge.apply_settings([{"id": p["id"], "settings": _corrective_settings(sliders)}])
+    warnings = report.setdefault("warnings", [])
+    _apply(bridge, [{"id": p["id"], "settings": _corrective_settings(sliders)}], warnings, lambda m: None)
 
     nudge_dir = run_dir / "nudges"
     nudge_dir.mkdir(exist_ok=True)

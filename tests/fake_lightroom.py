@@ -14,6 +14,7 @@ class FakeLightroom:
         self.snapshots = []
         self.labels = {}
         self.renders = 0
+        self.rejected_keys = set()  # keys this "Lightroom" silently ignores
 
     def ping(self):
         return {"version": "fake"}
@@ -28,9 +29,15 @@ class FakeLightroom:
         }
 
     def apply_settings(self, items):
+        not_taken = []
         for item in items:
-            self.photos[item["id"]]["settings"].update(item["settings"])
-        return {"applied": len(items)}
+            settings = self.photos[item["id"]]["settings"]
+            for key, value in item["settings"].items():
+                if key in self.rejected_keys:
+                    not_taken.append({"id": item["id"], "key": key, "wanted": value, "got": settings.get(key)})
+                else:
+                    settings[key] = value
+        return {"applied": len(items), "not_taken": not_taken}
 
     def render(self, items, size=1024):
         for item in items:

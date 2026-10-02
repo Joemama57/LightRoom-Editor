@@ -11,7 +11,7 @@ Grade one photo, select the rest, run `/match-look` in Claude Code. Every select
 - **Undo is easy.** Each photo gets a **"Before Match Look"** snapshot before anything changes, and every edit stays a normal, editable Lightroom setting.
 - **Photos that couldn't be matched well** get a yellow label, for example mixed lighting or blown-out frames.
 
-See [docs/PLAN.md](docs/PLAN.md) for the design.
+See [docs/PLAN.md](docs/PLAN.md) for the design, and [docs/EXISTING_PROJECTS.md](docs/EXISTING_PROJECTS.md) for how this compares with other Lightroom MCP projects and what was borrowed from them. In particular, the findings from real Lightroom 15.5.1 tests and the develop-key list come from [LrC_Autonomous_Gateway](https://github.com/jimjohnbeebe-jpg/LrC_Autonomous_Gateway) (MIT).
 
 ## Setup (macOS)
 1. `./setup.sh` creates `.venv` and installs `numpy` and `Pillow`.
@@ -45,7 +45,7 @@ python3 -m pytest -q
 ```
 
 ## Limits
-- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders, so these photos are flagged.
+- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders, so these photos are flagged. AI masks could fix this later.
 - Masks and local adjustments on the reference are not copied.
 - Claude Code has to run on the same Mac as Lightroom.
 - The solver's starting slider sensitivities are estimates. It learns the real ones during each run, but tuning them against real Lightroom renders is the next step.

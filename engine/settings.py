@@ -4,7 +4,10 @@ from .solver import CORRECTIVE
 
 # Settings that belong to one photo's framing, lens or local edits. These are
 # never copied from the reference.
+# Key names checked against a real Lightroom Classic 15.5.1 getDevelopSettings()
+# dump (see tests/fixtures/lrc15_develop_keys.json).
 PER_PHOTO_KEYS = {
+    "orientation",
     "Orientation",
     "WhiteBalance",  # "As Shot"/"Custom" label; Temp/Tint are solved instead
     "PaintBasedCorrections",
@@ -15,6 +18,24 @@ PER_PHOTO_KEYS = {
     "RetouchInfo",
     "RedEyeInfo",
     "AutoLateralCA",
+    "ChromaticAberrationB",
+    "ChromaticAberrationR",
+    "LensBlur",  # depth-based, specific to the frame
+    # Process Version 1/2 auto-tone switches: copying them would re-run auto tone
+    # on top of the solved exposure.
+    "AutoBrightness",
+    "AutoContrast",
+    "AutoExposure",
+    "AutoShadows",
+    # Panel switches for per-photo tools. The creative panels' switches
+    # (EnableToneCurve, EnableColorAdjustments, ...) are copied with the look.
+    "EnableLensCorrections",
+    "EnableTransform",
+    "EnableRetouch",
+    "EnableRedEye",
+    "EnableMaskGroupBasedCorrections",
+    "EnableDistractionRemoval",
+    "EnableDetail",
     "VignetteAmount",  # lens vignetting; PostCropVignette* is the creative one
     "VignetteMidpoint",
     # Detail settings depend on each photo's ISO and sharpness.

@@ -69,10 +69,10 @@ Lightroom's slider math is not public, so the engine runs a **closed loop**: set
 1. ✅ Engine (`measure`, `solver`, `match` command line) with tests against a simulated renderer.
 2. Bridge plugin (Lua), the bridge client, the settings split, the workflow, the contact sheet, the `/match-look` skill, and `setup.sh`. Tests use a fake Lightroom built on the simulator.
 3. Tune against real Lightroom renders on your Mac, including the prior slider sensitivities and the tolerance.
-4. Optional: a skin-tone guard (face detection) and a "keep each photo's own exposure intent" mode.
+4. Optional: a skin-tone guard and a fix for mixed light. Both would use AI subject/sky masks through `LrDevelopController.addToCurrentMask` (see `docs/EXISTING_PROJECTS.md`). Also optional: a "keep each photo's own exposure intent" mode.
 
 ## Known limits
-- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders. These photos are flagged for manual touch-up.
+- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders. These photos are flagged for manual touch-up for now; AI masks could handle them later (Build order step 4).
 - Local adjustments and masks on the reference are not copied.
 - Claude Code has to run on the same Mac as Lightroom, because the bridge is a local folder.
 
