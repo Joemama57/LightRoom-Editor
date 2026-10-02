@@ -7,6 +7,7 @@ and gets a reply in outbox/<id>.json:
 
 local LrApplication = import "LrApplication"
 local LrApplicationView = import "LrApplicationView"
+local LrDate = import "LrDate"
 local LrDevelopController = import "LrDevelopController"
 local LrExportSession = import "LrExportSession"
 local LrFileUtils = import "LrFileUtils"
@@ -50,7 +51,11 @@ local function writeAtomic(path, text)
 	local f = assert(io.open(tmp, "wb"))
 	f:write(text)
 	f:close()
-	assert(os.rename(tmp, path))
+	-- Lightroom's Lua has no os.rename; LrFileUtils.move won't overwrite, so clear the target first.
+	if LrFileUtils.exists(path) then
+		LrFileUtils.delete(path)
+	end
+	assert(LrFileUtils.move(tmp, path))
 end
 
 local function photoId(photo)
@@ -417,7 +422,7 @@ end
 local function heartbeatAge()
 	local ok, text = pcall(readFile, heartbeatPath)
 	local stamp = ok and tonumber(text)
-	return stamp and (os.time() - stamp) or math.huge
+	return stamp and (LrDate.currentTime() - stamp) or math.huge
 end
 
 function Bridge.run()
@@ -435,8 +440,8 @@ function Bridge.run()
 
 	local lastBeat = 0
 	while not stopRequested and not LrFileUtils.exists(stopPath) do
-		if os.time() - lastBeat >= HEARTBEAT_SECONDS then
-			lastBeat = os.time()
+		if LrDate.currentTime() - lastBeat >= HEARTBEAT_SECONDS then
+			lastBeat = LrDate.currentTime()
 			writeAtomic(heartbeatPath, tostring(lastBeat))
 		end
 		local requests = {}

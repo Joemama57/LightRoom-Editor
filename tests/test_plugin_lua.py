@@ -22,6 +22,11 @@ MOCK_SDK = r"""
 local py = ...
 local mods = {}
 
+-- Lightroom's plug-in sandbox has no os.rename/remove/time/execute.
+os.rename, os.remove, os.time, os.execute = nil, nil, nil, nil
+
+mods.LrDate = { currentTime = function() return py.now() end }
+
 mods.LrPathUtils = {
   getStandardFilePath = function(which) return py.home end,
   child = function(a, b) return a .. "/" .. b end,
@@ -34,7 +39,10 @@ mods.LrFileUtils = {
   createAllDirectories = function(p) py.makedirs(p) end,
   exists = function(p) return py.exists(p) end,
   delete = function(p) py.remove(p); return true end,
-  move = function(a, b) py.move(a, b); return true end,
+  move = function(a, b)
+    if py.exists(b) then return false end  -- like Lightroom: never overwrites
+    py.move(a, b); return true
+  end,
   files = function(dir)
     local list = py.listdir(dir)
     local i = 0
@@ -146,6 +154,9 @@ class PyHelpers:
         self.write_access = False
         self.stop_at = None
         self.bridge_module = None
+
+    def now(self):
+        return time.time() - 978307200  # seconds since 2001, like LrDate
 
     def makedirs(self, p):
         os.makedirs(p, exist_ok=True)
