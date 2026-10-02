@@ -198,8 +198,8 @@ def report(m, src):
         "**What the numbers say**",
         f"- The Monk swatches are **mostly yellower than measured skin**: {sum(t['h'] > 65 for t in m['monk'])} of 10 have a hue above 65°,"
         f" against {min(g['h'] for g in m['groups']):.0f}–{max(g['h'] for g in m['groups']):.0f}° for the measured population means. The lightest and darkest",
-        f"  tones are nearly neutral (chroma under 8). They were designed as a perceptual scale to show people, not as",
-        "  colorimetric skin. So Match Look uses them **only to name** the closest tone (by lightness and ITA), never to",
+        "  tones are nearly neutral (chroma under 8). They were designed as a perceptual scale to show people, not as",
+        "  colorimetric skin. So Match Look uses them **only to name** the closest tone (by lightness), never to",
         "  detect skin or judge its hue.",
         "",
         "## 3. ITA classes (Chardon et al. 1991)",

@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ from engine import skin
 from engine.colorspace import srgb_to_lab
 from engine.measure import measure
 
-SOURCES = json.loads(open("data/skin_sources.json").read())
+SOURCES = json.loads((Path(__file__).resolve().parent.parent / "data" / "skin_sources.json").read_text())
 
 
 def lab_of_hex(hx):

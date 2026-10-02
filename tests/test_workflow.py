@@ -308,3 +308,11 @@ def test_nudge_inside_a_mask(lightroom, tmp_path):
     assert mask["LocalTemperature"] == pytest.approx(-0.15)
     with pytest.raises(ValueError):
         run_nudge(lightroom, tmp_path, "DSC0002", {"Saturation": 10.0})  # local-only slider without a mask
+
+
+def test_learning_skips_photos_that_are_gone(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lightroom, tmp_path / "runs" / "1", learner=learner, log=quiet)
+    del lightroom.photos["shade"]  # deleted from the catalog since
+    assert learn_from_run(lightroom, tmp_path / "runs" / "1", learner, quiet) == 0
+    assert json.loads((tmp_path / "runs" / "1" / "report.json").read_text())["learned"]

@@ -1,9 +1,8 @@
-import numpy as np
 import pytest
 
 from engine.learning import Learner, light_bucket
 from engine.measure import measure
-from engine.solver import CORRECTIVE, SLIDER_SCALE, default_prior
+from engine.solver import default_prior
 from tests.simulator import capture, make_scene, render, run_loop
 from engine.solver import Options
 

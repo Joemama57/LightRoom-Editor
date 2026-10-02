@@ -52,7 +52,7 @@ Source: Monk Skin Tone Scale (Ellis Monk, Google, 2022), released under CC BY 4.
 **What the numbers say**
 - The Monk swatches are **mostly yellower than measured skin**: 8 of 10 have a hue above 65°, against 53–62° for the measured population means. The lightest and darkest
   tones are nearly neutral (chroma under 8). They were designed as a perceptual scale to show people, not as
-  colorimetric skin. So Match Look uses them **only to name** the closest tone (by lightness and ITA), never to
+  colorimetric skin. So Match Look uses them **only to name** the closest tone (by lightness), never to
   detect skin or judge its hue.
 
 ## 3. ITA classes (Chardon et al. 1991)

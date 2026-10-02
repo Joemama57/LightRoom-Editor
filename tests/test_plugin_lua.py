@@ -339,7 +339,7 @@ def test_get_settings_and_mask_adjust(lua_env):
     def client_fn(c):
         first = c.mask_adjust("12", "subject", {"LocalTemperature": -10, "LocalExposure2012": 0.3})
         second = c.mask_adjust("12", "subject", {"LocalTemperature": -20, "LocalExposure2012": 0.3})
-        (settings,) = c.get_settings([{"id": "12"}])
+        (settings,) = c.get_settings([{"id": "12"}, {"id": "999"}])  # 999 doesn't exist: skipped
         return first, second, settings
 
     first, second, settings = run_bridge_with_client(lua_env, client_fn)

@@ -208,11 +208,15 @@ function commands.render(params)
 	return out
 end
 
+-- Photos that no longer exist (deleted, or another catalog is open) are skipped.
 function commands.get_settings(params)
 	local out = {}
-	eachItem(params, function(photo, item)
-		out[#out + 1] = { id = item.id, settings = photo:getDevelopSettings() }
-	end)
+	for _, item in ipairs(params.items or {}) do
+		local ok, photo = LrTasks.pcall(findPhoto, item.id)
+		if ok then
+			out[#out + 1] = { id = item.id, settings = photo:getDevelopSettings() }
+		end
+	end
 	return out
 end
 

@@ -326,10 +326,15 @@ def _tiles(report, key):
     for p in report["photos"]:
         err = p["start_error"] if key == "start_preview" else p["final_error"]
         flags = [f for f in p["flags"] if key == "preview" or f not in REVIEW_FLAGS]
+        notes = list(flags)
+        if key == "preview" and p.get("skin_vs_reference") and p["skin_vs_reference"] != "matches the reference":
+            notes.append(f"skin {p['skin_vs_reference']}")
+        if key == "preview" and p.get("learned_adjustment"):
+            notes.append("learned adj.")
         tiles.append({
             "path": p[key],
             "title": p["fileName"],
-            "subtitle": f"error {err:.1f}" + (f" · {', '.join(flags)}" if flags else ""),
+            "subtitle": f"error {err:.1f}" + (f" · {', '.join(notes)}" if notes else ""),
             "highlight": key == "preview" and bool(REVIEW_FLAGS & set(p["flags"])),
         })
     return tiles
@@ -498,10 +503,8 @@ def run_calibrate(bridge, out_dir, learner, size=768, log=print):
             for ph in photos:
                 sl = dict(base[ph["id"]])
                 step = raw_step if is_raw(ph) else jpeg_step
-                lo, hi = (2000.0, 50000.0) if (key == "Temperature" and is_raw(ph)) else (-100.0, 100.0)
-                if key == "Exposure2012":
-                    lo, hi = -5.0, 5.0
-                # Step toward the middle of the range so it never clips.
+                hi = 50000.0 if (key == "Temperature" and is_raw(ph)) else 5.0 if key == "Exposure2012" else 100.0
+                # Step down instead of up when up would leave the slider's range.
                 sl[key] = sl[key] + step if sl[key] + step <= hi else sl[key] - step
                 stepped[ph["id"]] = sl
             _apply(bridge, [{"id": pid, "settings": _corrective_settings(sl)} for pid, sl in stepped.items()],

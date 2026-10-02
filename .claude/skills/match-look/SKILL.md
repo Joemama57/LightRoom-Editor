@@ -1,12 +1,16 @@
 ---
 name: match-look
-description: Match the color grade of the active Lightroom Classic photo across the other selected photos, correcting each photo's white balance, exposure and tone for its lighting, then visually review the result. Use when the user runs /match-look or asks to apply/sync/match their grade or look across selected Lightroom photos.
-argument-hint: "[strength 0-100]"
+description: Match the color grade of the active Lightroom Classic photo across the other selected photos, correcting each photo's white balance, exposure and tone for its lighting, then visually review the result (skin tones included) and learn from it. Use when the user runs /match-look or asks to apply/sync/match their grade or look across selected Lightroom photos.
+argument-hint: "[strength 0-100] [skin] [color-only]"
 ---
 
 # /match-look
 
-You are the agent here. The engine does the measuring and slider solving; you check the Lightroom connection, run it, **look at the results yourself**, fix what still looks off, and report back.
+You are the agent here. The engine measures, solves the sliders and learns from every run. Your job:
+1. Check the Lightroom connection.
+2. Choose the options.
+3. Run the match.
+4. **Look at the results yourself**, fix what still looks off, and report back.
 
 Run every command from the repository root. Use `.venv/bin/python` if it exists; otherwise use `python3`. Below, `PY` means whichever one you picked.
 
@@ -24,47 +28,81 @@ Then run `PY -m engine.bridge selection` and confirm:
 
 Tell the user in one line which photo is the reference and how many photos will change. If nothing is active, ask them to click the graded photo so it is the most-selected one.
 
-## 2. Match
-Run `PY -m engine.workflow match --strength S`. S comes from `$ARGUMENTS`: if a number from 0 to 100 is given, divide it by 100. Otherwise use 1.0.
+## 2. Choose the options
+Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can see it after step 3; re-run with different options if you got them wrong.
 
-This writes the creative look and solved sliders into Lightroom. It takes a "Before Match Look" snapshot on every target first. It prints a JSON summary that includes the `run` folder, both contact sheets, and the following for each photo:
-- `start_error`: how far off the photo was with the look only pasted
-- `final_error`: how far off it is after matching (under 2 is a good match)
-- `flags`
+- **Strength:** a number from 0 to 100 becomes `--strength N/100`. The default is 1.0.
+- **`--skin`** if people are in the photos, or the user says skin/portrait. This keeps skin tones consistent using a model built from measured skin colour (`docs/SKIN_TONES.md`).
+- **`--color-only`** if the user wants each photo to keep its own brightness (a deliberately dark or bright frame, a mood sequence), or says "just the colour".
+- **Learning is on by default.** Each run:
+  - first learns from any edits the user made to the previous run's photos;
+  - starts from the slider response learned on this camera;
+  - applies learned preferences.
 
-## 3. Review with your own eyes
+  Add `--no-learning` only if the user asks.
+
+If the user has never run Match Look before (`PY -m engine.learning show` reports 0 runs and no sensitivity samples), offer calibration. It takes about 30 s per photo and puts every photo back exactly as it was afterwards. Run it only if they agree: `PY -m engine.workflow calibrate` on 3–5 selected photos in different light. Afterwards, ask them to reselect the reference as the active photo.
+
+## 3. Match
+Run `PY -m engine.workflow match [options]`.
+
+It writes the look and the solved sliders into Lightroom. It takes a "Before Match Look" snapshot on every target first. It prints a JSON summary with:
+- the `run` folder and both contact sheets
+- `reference_skin`
+- for each photo:
+  - `start_error`: how far off it was with the look only pasted
+  - `final_error`: how far off it is after matching (under 2 is a good match)
+  - `flags`
+  - `learned_adjustment`: a learned preference that was applied, if any
+  - `skin_vs_reference`
+
+Each photo's full details are in `RUN/report.json`. That includes its skin description: ITA class, nearest Monk tone, hue note.
+
+## 4. Review with your own eyes
 Read both images with the Read tool:
 - `contact_sheet_before.jpg` shows the look pasted, with no correction.
 - `contact_sheet.jpg` shows the final result. The reference is the first tile.
 
 For each photo, compare it against the reference. Look at:
 - **overall warmth and tint**
-- **skin tones** (the most important, if people are present)
+- **skin tones**, the most important if people are present. Use `skin_vs_reference` and `skin.hue_note` from the report as a second opinion, but trust what you see.
 - **brightness of the main subject**
-- **contrast and depth** (how deep the shadows are, how bright the highlights are)
+- **contrast and depth**
 
-Ignore differences that come from the content itself, such as a different background or a bright sky in one frame. The goal is the same look, not identical pixels.
+Ignore differences that come from the content itself (a different background, a bright sky in one frame). The goal is the same look, not identical pixels.
 
-For any photo that clearly doesn't match, nudge it:
+For any photo that clearly doesn't match, **nudge the whole photo:**
 ```
 PY -m engine.workflow nudge --run RUN --photo FILE_NAME Temperature=+150 Tint=-3 Exposure2012=+0.15
 ```
-Rules for nudging:
 - **Values are relative.** For raw files, Temperature is in Kelvin (warmer = +). For JPEGs it is an offset from −100 to 100.
 - **Keep nudges small:**
   - Temperature: at most ±400 K on raw, or ±10 on JPEG
   - Tint: at most ±8
   - Exposure2012: at most ±0.5
   - Shadows2012, Highlights2012, Whites2012, Blacks2012: at most ±20
-- **Re-read `contact_sheet.jpg` after each round.** Do at most 2 rounds per photo.
+
+**Experimental: nudge only part of the photo.** Use this for mixed light, for example a person lit by a window in a tungsten-lit room. Only use it when a whole-photo nudge can't fix it, because fixing the subject would ruin the background or the other way round:
+```
+PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperature=-10 Exposure2012=+0.2
+```
+- `--mask` takes `subject`, `sky`, `background` or `people`.
+- Inside a mask, Temperature and Tint are −100..100 local sliders, and Saturation is also allowed. Keep these changes at ±15 or less.
+- It switches Lightroom to the Develop module and creates an AI mask the first time, which takes a few seconds. It then puts the user's selection back.
+- If it fails, say so and leave that photo for the user. Lightroom versions differ in AI-mask support.
+
+**Limits on reviewing:**
+- Re-read `contact_sheet.jpg` after each round. Do at most 2 rounds per photo.
 - If a photo still looks wrong after that, leave it and report it.
-- Photos whose flags say the lighting is mixed (`not_converged`, `low_neutral_confidence`) or blown out (`mostly_clipped`) are often better left for the user than forced.
+- Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
+- Never change photos outside this run. Never change creative settings: the look always stays exactly the reference's.
 
-Never change photos outside this run. Never change anything except the corrective sliders above. The creative look always stays exactly the reference's.
+Every nudge you make, and every edit the user makes later in Lightroom, is learned from at the next run. You don't need to run anything extra. To learn right away, for example before closing, run `PY -m engine.workflow learn`.
 
-## 4. Report
+## 5. Report
 Keep the report short:
-- **A table:** one row per photo with the file name, error before → after, any nudge you made and why (for example "skin looked green, Tint +4"), and flags.
+- **A table:** one row per photo with the file name, error before → after, any learned adjustment applied, any nudge you made and why (for example "skin looked green, Tint +4"), and flags.
+- **Skin**, if present: one line on how consistent it is across the set. Use the report's words (for example "DSC0042: greener than the reference, fixed").
 - **Flagged photos:** which photos have the yellow label, and why each needs the user's eye.
+- **What was learned:** one line, from `PY -m engine.learning show`. For example "learned from 2 edits you made last time; this camera's slider response now has 40 samples".
 - **How to undo:** the "Before Match Look" snapshot on each photo (Develop ▸ Snapshots), or Edit ▸ Undo. If the summary has a snapshot `warning`, say that undo is through the History panel instead.
-- **Where the files are:** the path of the final contact sheet.

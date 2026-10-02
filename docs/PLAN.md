@@ -66,13 +66,20 @@ Lightroom's slider math is not public, so the engine runs a **closed loop**: set
 5. Report what changed for each photo and which ones were flagged, and remind the user that they can undo with the "Before Match Look" snapshot.
 
 ## Build order
-1. ✅ Engine (`measure`, `solver`, `match` command line) with tests against a simulated renderer.
-2. Bridge plugin (Lua), the bridge client, the settings split, the workflow, the contact sheet, the `/match-look` skill, and `setup.sh`. Tests use a fake Lightroom built on the simulator.
-3. Tune against real Lightroom renders on your Mac, including the prior slider sensitivities and the tolerance.
-4. Optional: a skin-tone guard and a fix for mixed light. Both would use AI subject/sky masks through `LrDevelopController.addToCurrentMask` (see `docs/EXISTING_PROJECTS.md`). Also optional: a "keep each photo's own exposure intent" mode.
+1. ✅ Engine: `measure`, `solver` and the `match` command line, tested against a simulated renderer.
+2. ✅ Bridge plugin, bridge client, settings split, workflow, contact sheet, the `/match-look` skill and `setup.sh`.
+3. ✅ Adopted findings from LrC_Autonomous_Gateway's tests in real Lightroom 15.5.1: read-back of every write, state kept on disk, History names, and the real develop-key list.
+4. ✅ Skin-tone model built from measured data (`docs/SKIN_TONES.md`) and the `--skin` guard.
+5. ✅ More robust white balance:
+   - start from each photo's camera "As Shot" values;
+   - limit how far white balance can move;
+   - search for neutrals near the reference's neutral point, so foliage and other dominant colours aren't mistaken for a cast.
+6. ✅ Self-learning (`engine/learning.py`): per-camera slider response learned from every run, your edits learned as preferences, and `calibrate` to seed it.
+7. ✅ `--color-only` (keep each photo's own exposure) and experimental AI-mask nudges.
+8. ⏳ First run in real Lightroom on your Mac (`docs/MAC_TESTING.md`), then tune the defaults from the results.
 
 ## Known limits
-- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders. These photos are flagged for manual touch-up for now; AI masks could handle them later (Build order step 4).
+- Mixed light in one frame, such as window light plus tungsten, can't be fully fixed with whole-photo sliders. These photos are flagged, and the experimental AI-mask nudges can correct the subject separately.
 - Local adjustments and masks on the reference are not copied.
 - Claude Code has to run on the same Mac as Lightroom, because the bridge is a local folder.
 

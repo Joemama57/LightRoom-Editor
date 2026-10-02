@@ -20,4 +20,6 @@ Then check the connection from here:
   .venv/bin/python -m engine.bridge ping
 
 And in Claude Code (started in this folder): select your photos, click the graded one, run /match-look
+
+First time? docs/MAC_TESTING.md walks through a full test, including calibration.
 MSG
