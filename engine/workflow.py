@@ -106,6 +106,7 @@ def latest_unlearned_run(runs_dir, exclude=None):
     return None
 
 
+<<<<<<< Updated upstream
 # A run is too unreliable to learn taste from when more than this share of its
 # photos was flagged, or its fitted grade stayed this far from the reference:
 # edits made to such a run fix the engine's mistakes, they aren't taste.
@@ -173,6 +174,25 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
       learned from: edits to it correct the engine, they aren't taste.
     The report records why a run was skipped. backup_to: where to back up
     learning.json before changing it."""
+=======
+def look_was_removed(report, p, settings):
+    """True when the look this run wrote is no longer on the photo: the match
+    was undone, a snapshot was restored or the photo was reset. What its
+    sliders say now is not an edit of the match, so it isn't learned from."""
+    written = {**(report.get("reference", {}).get("creative_look") or {}), **(p.get("look_settings") or {})}
+    written = {k: float(v) for k, v in written.items() if isinstance(v, (int, float)) and abs(v) >= 1.0}
+    if len(written) < 3:
+        return False  # too little of a look to tell
+    gone = sum(1 for k, v in written.items() if abs(float(settings.get(k) or 0.0) - v) > 1.0)
+    return gone > len(written) / 2
+
+
+def learn_from_run(bridge, run_dir, learner, log=print):
+    """Compare a run's photos as they are in Lightroom now with what the match chose,
+    and learn the differences (your edits after the match, and review nudges) as
+    preferences. Photos that no longer carry the run's look are skipped. Each run
+    is learned from once."""
+>>>>>>> Stashed changes
     run_dir = Path(run_dir)
     report = json.loads((run_dir / "report.json").read_text())
     if report.get("learned"):
@@ -187,10 +207,17 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
     except BridgeError as e:
         log(f"Couldn't read last run's photos to learn from them: {e}")
         return 0
+<<<<<<< Updated upstream
     candidates, undone = [], 0
+=======
+    learned = undone = 0
+>>>>>>> Stashed changes
     for p in report["photos"]:
         settings = current.get(p["id"])
         if not settings or "matched" not in p:
+            continue
+        if look_was_removed(report, p, settings):
+            undone += 1
             continue
         kept = {k: settings.get(k, p["final"].get(k, 0.0)) for k in CORRECTIVE}
         if _was_undone(p, settings, report):
@@ -208,8 +235,16 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
         if learner.observe_correction(p.get("camera"), p["is_raw"], bucket, p["matched"], kept,
                                       allow_zero=True) == "correction":
             learned += 1
+<<<<<<< Updated upstream
     _mark_learned(run_dir, report, True)
     learner.save(backup_to=backup_to)
+=======
+    report["learned"] = True
+    (run_dir / "report.json").write_text(json.dumps(report, indent=2))
+    learner.save()
+    if undone:
+        log(f"Not learning from {undone} photo(s) whose last match was undone or reset ({run_dir.name})")
+>>>>>>> Stashed changes
     if learned:
         log(f"Learned from {learned} photo(s) adjusted after the last run ({run_dir.name})")
     if undone:

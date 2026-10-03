@@ -287,6 +287,28 @@ def test_learn_from_run_once(lightroom, tmp_path):
     assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 0  # already learned
 
 
+def test_an_undone_match_is_not_learned_as_your_taste(lightroom, tmp_path):
+    before = {pid: dict(p["settings"]) for pid, p in lightroom.photos.items()}
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    for pid, settings in before.items():  # Edit > Undo, or the "Before Match Look" snapshot
+        lightroom.photos[pid]["settings"] = dict(settings)
+    messages = []
+    assert learn_from_run(lightroom, tmp_path / "run", learner, messages.append) == 0
+    assert learner.data["preference"] == {} and learner.data["corrections"] == 0
+    assert "undone" in " ".join(messages)
+
+
+def test_an_edit_that_keeps_the_look_is_still_learned(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    report = run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    settings = lightroom.photos["tung"]["settings"]
+    settings["Exposure2012"] = tung["matched"]["Exposure2012"] + 0.3
+    settings["Contrast2012"] += 10  # one look slider changed by hand: still this run's look
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 1
+
+
 def test_calibrate_learns_and_restores_every_photo(lightroom, tmp_path):
     before = {pid: dict(p["settings"]) for pid, p in lightroom.photos.items()}
     learner = Learner(tmp_path / "learning.json")

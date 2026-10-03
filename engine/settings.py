@@ -10,6 +10,8 @@ PER_PHOTO_KEYS = {
     "orientation",
     "Orientation",
     "WhiteBalance",  # "As Shot"/"Custom" label; Temp/Tint are solved instead
+    "IncrementalTemperature",  # JPEG/TIFF white balance; the bridge maps Temp/Tint onto these
+    "IncrementalTint",
     "PaintBasedCorrections",
     "GradientBasedCorrections",
     "CircularGradientBasedCorrections",

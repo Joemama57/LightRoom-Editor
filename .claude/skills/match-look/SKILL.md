@@ -14,6 +14,15 @@ You are the agent here. The engine measures, solves the sliders and learns from 
 
 Run every command from the repository root. Use `.venv/bin/python` if it exists; otherwise use `python3`. Below, `PY` means whichever one you picked.
 
+## Before grading: read the learnings
+This is an added step. If `learnings/` is missing or has no entries, skip this section and the "After grading" section, and carry on with steps 1–5 exactly as written.
+
+- Read `learnings/README.md`, then `learnings/failures.md` (always), then only the topic files the README's table marks as relevant to this job.
+- Run `PY -m engine.learning show` and keep its output to compare against after the run. This is the only way to read `~/.matchlook/learning.json`: never edit that file directly and never run `engine.learning reset`. The normal commands (match, nudge, learn) update it as designed.
+- Copy `~/.matchlook/learning.json` to `~/.matchlook/learning.json.bak` before the match.
+- Apply the relevant takeaways when choosing options, reviewing and nudging. They inform your judgement inside steps 1–5; they do not replace any step or limit there.
+- If an entry conflicts with what `engine.learning show` reports, or a learned value looks stale or wrong, tell the user with the evidence. Do not resolve it yourself.
+
 ## 1. Check the connection
 Run `PY -m engine.bridge ping`.
 
@@ -137,3 +146,13 @@ Keep the report short:
 - **Flagged photos:** which photos have the yellow label, and why each needs the user's eye.
 - **What was learned:** one line, from `PY -m engine.learning show`. For example "learned from 2 edits you made last time; this camera's slider response now has 40 samples".
 - **How to undo:** the "Before Match Look" snapshot on each photo (Develop ▸ Snapshots), or Edit ▸ Undo. If the summary has a snapshot `warning`, say that undo is through the History panel instead.
+
+## After grading: record what you found
+This is an added step, done after the report in step 5. Skip it if `learnings/` is missing or has no entries.
+
+- Add each new finding to the matching topic file in `learnings/`, newest first, in the README's entry format: dated, citing the run folder and photo, ending with a takeaway.
+- Only record a finding backed by a measurable result (an error, a slider value, a measured colour, a flag) or by something the user said. Leave out impressions you can't tie to either.
+- Don't copy values from `learning.json` into an entry. Point at the key instead (for example "see `learning.json` → `preference` → `raw|iPhone 16 Pro Max|daylight`").
+- If a new result contradicts an existing entry, edit that entry and say what changed.
+- If you added a topic file, add its row to the table in `learnings/README.md`.
+- Add one line to the report: which entries you applied and which you added.

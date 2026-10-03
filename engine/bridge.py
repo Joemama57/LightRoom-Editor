@@ -19,6 +19,12 @@ from pathlib import Path
 
 DEFAULT_DIR = Path.home() / ".matchlook" / "bridge"
 
+# Lightroom keeps white balance for rendered files (JPEG/TIFF/HEIC) in
+# IncrementalTemperature/IncrementalTint (-100..100). Writing "Temperature" to
+# one is read as Kelvin and pins it to -100 (seen on LrC 15 with iPhone JPEGs).
+# The engine only speaks Temperature/Tint; the bridge translates both ways.
+INCREMENTAL_WB = {"Temperature": "IncrementalTemperature", "Tint": "IncrementalTint"}
+
 
 class BridgeError(RuntimeError):
     pass
@@ -31,6 +37,7 @@ class Bridge:
         self.outbox = self.root / "outbox"
         self.timeout = timeout
         self.poll = poll
+        self._incremental = {}  # photo id -> True if its white balance is incremental
 
     def call(self, command, timeout=None, **params):
         self.inbox.mkdir(parents=True, exist_ok=True)
@@ -63,12 +70,42 @@ class Bridge:
     def ping(self):
         return self.call("ping", timeout=5)
 
+    def _from_lightroom(self, entries):
+        for entry in entries or []:
+            settings = entry.get("settings")
+            if not isinstance(settings, dict):
+                continue
+            incremental = "IncrementalTemperature" in settings and settings.get("Temperature") is None
+            self._incremental[entry["id"]] = incremental
+            if incremental:
+                for key, lr_key in INCREMENTAL_WB.items():
+                    if lr_key in settings:
+                        settings[key] = settings[lr_key]
+        return entries
+
+    def _to_lightroom(self, items):
+        unknown = [{"id": i["id"]} for i in items if i["id"] not in self._incremental]
+        if unknown:
+            self.get_settings(unknown)
+        out = []
+        for item in items:
+            settings = item["settings"]
+            if self._incremental.get(item["id"]):
+                settings = dict(settings)
+                for key, lr_key in INCREMENTAL_WB.items():
+                    if key in settings:
+                        settings[lr_key] = round(settings.pop(key))
+            out.append(dict(item, settings=settings))
+        return out
+
     def get_selection(self):
-        return self.call("get_selection")
+        selection = self.call("get_selection")
+        self._from_lightroom(selection.get("photos"))
+        return selection
 
     def apply_settings(self, items):
         """items: [{"id": ..., "settings": {...}}]"""
-        return self.call("apply_settings", items=items)
+        return self.call("apply_settings", items=self._to_lightroom(items))
 
     def render(self, items, size=1024):
         """items: [{"id": ..., "path": "/abs/out.jpg"}]; returns the same paths."""
@@ -76,7 +113,7 @@ class Bridge:
 
     def get_settings(self, items):
         """items: [{"id": ...}] -> [{"id": ..., "settings": {...}}]"""
-        return self.call("get_settings", items=items)
+        return self._from_lightroom(self.call("get_settings", items=items))
 
     def mask_adjust(self, photo_id, kind, values):
         """Experimental: create (or update) an AI mask of `kind` ("subject", "sky",
