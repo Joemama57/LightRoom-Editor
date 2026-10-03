@@ -59,6 +59,8 @@ RANGES = {
     "Blacks2012": (-100.0, 100.0),
 }
 JPEG_TEMP_RANGE = (-100.0, 100.0)
+# Default (Exposure EV, other tone sliders) radius around the starting values.
+TONE_LIMITS = (2.0, 40.0)
 
 # Prior d(metric)/d(slider) in internal units (rows = METRIC_KEYS, cols = CORRECTIVE).
 # Temperature column is per mired for raw; the sign flips because a higher
@@ -98,6 +100,10 @@ class Options:
     # offset units for JPEGs. Keeps a frame dominated by one colour (foliage,
     # a red wall) from dragging the white balance somewhere absurd.
     wb_limits: tuple = (None, 40.0)
+    # How far exposure (EV) and Shadows/Highlights/Whites/Blacks may move from
+    # the starting point. Matching a dark interior to a bright exterior would
+    # otherwise push exposure until the frame blows out.
+    tone_limits: tuple = TONE_LIMITS
 
 
 @dataclass
@@ -268,6 +274,7 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     du = np.clip(du, -4.0, 4.0)
     x_next = (u_cur + du) * SLIDER_SCALE
     x_next = _limit_white_balance(x_next, xs[0], opts.wb_limits)
+    x_next = _limit_tone(x_next, xs[0], opts.tone_limits)
 
     return Proposal(
         sliders=_to_sliders(x_next, is_raw),
@@ -288,12 +295,34 @@ def _limit_white_balance(x, x_start, limits):
     return x
 
 
+def _limit_tone(x, x_start, limits):
+    if limits is None:
+        return x
+    exposure_radius, tone_radius = limits
+    x = x.copy()
+    x[2] = np.clip(x[2], x_start[2] - exposure_radius, x_start[2] + exposure_radius)
+    x[3:] = np.clip(x[3:], x_start[3:] - tone_radius, x_start[3:] + tone_radius)
+    return x
+
+
+def at_tone_limit(start, sliders, is_raw, limits=TONE_LIMITS):
+    """True when the solved tone sliders sit on the edge of their allowed range."""
+    if limits is None:
+        return False
+    d = np.abs(_to_internal(sliders, is_raw) - _to_internal(start, is_raw))
+    return bool(d[2] >= limits[0] - 0.01 or np.any(d[3:] >= limits[1] - 0.1))
+
+
 def wb_limits(is_raw, wb_from_camera):
     """Default white-balance limits. Starting from the camera's own white
     balance, a match needs only the reference's creative offset plus a small
     correction; starting from the reference's values, the light may differ a lot."""
     if wb_from_camera:
         return (80.0 if is_raw else 30.0, 30.0)
+    if not is_raw:
+        # A JPEG already has its white balance baked in; it needs a nudge, not
+        # a full re-balance (frames full of coloured light swing wildly otherwise).
+        return (30.0, 20.0)
     return (None, 40.0)
 
 

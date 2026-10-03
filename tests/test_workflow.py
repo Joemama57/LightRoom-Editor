@@ -316,3 +316,26 @@ def test_learning_skips_photos_that_are_gone(lightroom, tmp_path):
     del lightroom.photos["shade"]  # deleted from the catalog since
     assert learn_from_run(lightroom, tmp_path / "runs" / "1", learner, quiet) == 0
     assert json.loads((tmp_path / "runs" / "1" / "report.json").read_text())["learned"]
+
+
+def led_interior(size=96):
+    """A dark car interior: black trim, orange leather and blue ambient LEDs, almost nothing neutral."""
+    scene = np.full((size, size, 3), 0.006)
+    scene[size // 2:, :] = (0.12, 0.035, 0.012)  # orange leather
+    scene[size // 4:size // 4 + 6, :] = (0.02, 0.03, 0.6)  # LED strip
+    scene[:size // 6, size // 3:] = (0.04, 0.03, 0.25)  # blue glow on the roof
+    return scene
+
+
+def test_dark_led_interior_is_not_blown_out(lightroom, tmp_path):
+    lightroom.photos["led"] = photo(capture(led_interior(), 5500), "DSC0006.ARW")
+    report = run_match(lightroom, tmp_path, log=lambda m: None)
+    led = next(p for p in report["photos"] if p["id"] == "led")
+    assert "different_scene" in led["flags"]
+    # Colour matched, brightness left as pasted: no +5 EV blow-out.
+    assert led["final"]["Exposure2012"] == led["start"]["Exposure2012"]
+    assert lightroom.labels.get("led") == "yellow"
+    # The ordinary frames are still matched normally.
+    for p in report["photos"]:
+        if p["id"] != "led":
+            assert "different_scene" not in p["flags"] and p["final_error"] < 2.0

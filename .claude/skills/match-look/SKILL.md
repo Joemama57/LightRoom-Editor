@@ -26,7 +26,13 @@ Then run `PY -m engine.bridge selection` and confirm:
 - There is an `active` photo. This is the graded reference.
 - At least one other photo is selected.
 
-Tell the user in one line which photo is the reference and how many photos will change. If nothing is active, ask them to click the graded photo so it is the most-selected one.
+Tell the user in one line which photo is the reference and how many photos will change.
+
+**Mixed sets.** If the selection mixes very different scenes (exteriors in daylight and interiors under coloured LED lighting, or day and night), one reference can't fit them all. Before matching, look at the thumbnails from step 3's `contact_sheet_before.jpg`, or ask. Suggest running each scene type as its own batch, with its own graded reference:
+- select the exteriors and click a graded exterior, run, then
+- select the interiors and click a graded interior, run.
+
+Photos the engine marks `different_scene` already get colour-only matching and a yellow label. They are the sign that a split is needed. If nothing is active, ask them to click the graded photo so it is the most-selected one.
 
 ## 2. Choose the options
 Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can see it after step 3; re-run with different options if you got them wrong.
@@ -94,6 +100,8 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 **Limits on reviewing:**
 - Re-read `contact_sheet.jpg` after each round. Do at most 2 rounds per photo.
 - If a photo still looks wrong after that, leave it and report it.
+- `different_scene`: a dark, coloured-light frame against a normally lit reference. Only its colour was matched; its brightness was left alone. Don't nudge it toward the reference; recommend matching it in a batch with a similar reference instead.
+- `tone_limited`: exposure or tone hit the safety limit (±2 EV, ±40 on the tone sliders) and still doesn't match, usually a content difference. Check it doesn't look too dark or flat before nudging.
 - Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
 - Never change photos outside this run. Never change creative settings: the look always stays exactly the reference's.
 

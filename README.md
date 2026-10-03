@@ -73,6 +73,7 @@ python3 -m tools.build_skin_model    # after editing data/skin_sources.json
 ## Limits
 - Mixed light within one frame (window plus tungsten) can't be fully fixed with whole-photo sliders. These photos are flagged, and the experimental AI-mask nudges can fix the subject separately.
 - Frames whose *content* differs a lot from the reference (half foliage, a dark interior) get the right white balance but are flagged rather than forced to match in tone.
+- Mixed sets (daylight exteriors plus LED-lit interiors) match best as separate batches, each with its own reference. Dark, coloured-light frames are detected (`different_scene`), matched for colour only and labelled. Exposure and tone never move more than ±2 EV / ±40 from where they start; JPEG white balance never more than ±30 Temperature / ±20 Tint.
 - Masks and local adjustments on the reference are not copied.
 - Claude Code has to run on the same Mac as Lightroom.
 - Everything is tested against a simulated Lightroom. The first real-Lightroom run is [docs/MAC_TESTING.md](docs/MAC_TESTING.md).

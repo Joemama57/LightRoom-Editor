@@ -98,3 +98,11 @@ def test_sliders_clamped_to_lightroom_ranges(reference):
 def test_empty_history_rejected(reference):
     with pytest.raises(ValueError):
         propose(reference, [], is_raw=True)
+
+
+def test_jpeg_white_balance_and_tone_are_limited():
+    from engine.solver import TONE_LIMITS, _limit_tone, wb_limits
+    assert wb_limits(False, False) == (30.0, 20.0)
+    start = np.zeros(7)
+    x = _limit_tone(np.array([0, 0, 4.5, 90, -90, 10, 0.0]), start, TONE_LIMITS)
+    assert x[2] == TONE_LIMITS[0] and x[3] == TONE_LIMITS[1] and x[4] == -TONE_LIMITS[1] and x[5] == 10

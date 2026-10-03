@@ -21,20 +21,21 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from . import contact_sheet
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
-from .guards import flags_for
+from .guards import different_scene, flags_for
 from .learning import Learner, light_bucket
 from .measure import Metrics, measure_file
 from .settings import is_raw, split, starting_corrective
-from .solver import CORRECTIVE, MIN_SKIN_FRACTION, Options, blend, clamp, match_error, propose, wb_limits
+from .solver import CORRECTIVE, MIN_SKIN_FRACTION, Options, at_tone_limit, blend, clamp, match_error, propose, wb_limits
 
 RUNS_DIR = Path.home() / ".matchlook" / "runs"
 SNAPSHOT_NAME = "Before Match Look"
-REVIEW_FLAGS = {"not_converged", "mostly_clipped", "low_neutral_confidence"}
+REVIEW_FLAGS = {"not_converged", "mostly_clipped", "low_neutral_confidence", "different_scene", "tone_limited"}
 
 
 def _corrective_settings(sliders):
@@ -209,6 +210,11 @@ def run_match(
             s = state[item["id"]]
             metrics = measure_file(item["path"], hint)
             s["history"].append({"sliders": s["sliders"], "metrics": metrics.to_dict(), "preview": item["path"]})
+            if len(s["history"]) == 1 and different_scene(ref_metrics, metrics) and not s["options"].color_only:
+                # A different kind of scene (a dark LED-lit interior against a
+                # bright exterior): match its colour, keep its own brightness.
+                s["options"] = replace(s["options"], color_only=True)
+                s["extra_flags"].append("different_scene")
             p = propose(ref_metrics, s["history"], is_raw=s["is_raw"], tolerance=tolerance,
                         max_iterations=max_iterations, options=s["options"])
             s["proposal"] = p
@@ -256,6 +262,9 @@ def run_match(
         o = s["options"]
         s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only)
         s["flags"] = flags_for(s["final_metrics"], s["proposal"], tolerance)
+        # Only worth a look when the limit kept it from matching.
+        if s["final_error"] >= tolerance and not o.color_only and at_tone_limit(s["start"], s["proposal"].sliders, s["is_raw"], o.tone_limits):
+            s["flags"].append("tone_limited")
         unscaled = strength == 1.0 and not s["learned_adjustment"]
         if unscaled and s["final_error"] >= tolerance and "not_converged" not in s["flags"]:
             s["flags"].append("not_converged")
