@@ -60,6 +60,11 @@ Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can
     2. Check that it looks like the copy, then select the original as the active photo with the others (not the copy) and re-run.
 
     The engine doesn't copy masks. If the edit used AI masks (sky, subject), suggest Lightroom's Sync Settings ▸ Masking from the original afterwards: Lightroom detects the masks again on each photo.
+- **A reference from outside the catalog** (someone else's photo, a downloaded or shared image, or any reference with no Lightroom edits whose original isn't selected): the engine reads one grade from its pixels and puts it on every photo. This replaces the small per-photo colour match as the default for this case.
+  - The summary has a warning saying so, and a `style_grade` block. That warning is expected here; only ask for the original if the reference is the user's own export.
+  - The grade covers the tone curve's ends (faded or crushed blacks, soft highlights), contrast, saturation, the tint of shadows and highlights, and the colours both the reference and the photos show. Each photo's white balance and exposure are solved first, and the grade keeps each photo's mid-tone brightness.
+  - It works best when the reference shows a similar kind of scene (a portrait for portraits, a landscape for landscapes). A very different scene can carry its content into the grade.
+  - `--look-strength 0.5` applies half of the grade. `--look-per-photo` goes back to the old small per-photo colour match.
 - **Learning is on by default.** Each run:
   - first learns from any edits the user made to the previous run's photos;
   - starts from the slider response learned on this camera;
@@ -87,6 +92,11 @@ It writes the look and the solved sliders into Lightroom. It takes a "Before Mat
   - `at_limits`: grade sliders that ended at their bound
   - `unmatched`: regions still far off after fitting (for example "top" or "left"). These were probably edited locally in the copy (a mask or brush), so global sliders can't follow them: tell the user, and suggest an AI-mask nudge (`--mask sky`) if that region matters
 - `look_start_error` → `look_final_error` and `look_note` per photo: only when the conservative per-photo colour match ran
+- `style_grade` (only for a reference from outside the catalog):
+  - `look_settings`: the one grade put on every photo
+  - `note`: its biggest parts, for example "saturation -24, contrast -20"
+  - `error_before` → `error_after`: how far the photos' look was from the reference's, before and after, averaged over the set. `look_start_error` → `look_final_error` per photo are the same measure.
+  - `limited`: a slider ended at its bound, usually because the reference's content differs from the photos'
   - `flags`
   - `learned_adjustment`: a learned preference that was applied, if any
   - `skin_vs_reference`
@@ -141,6 +151,7 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 - `tone_limited`: exposure or tone hit the safety limit (±2 EV, ±40 on the tone sliders) and still doesn't match, usually a content difference. Check it doesn't look too dark or flat before nudging.
 - Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
 - `look_limited` (per-photo colour match only): a colour slider hit its limit and the photo still differs, usually because the content differs. Check it before nudging.
+- **With a reference from outside the catalog:** if the grade looks too strong or carries the reference's content (for example a whole set turned teal because the reference was mostly sea), say so and suggest a re-run with `--look-strength 0.5`. If one part of the grade is off on every photo, use one `nudge --photo all --grade` command rather than per-photo nudges.
 - Never change photos outside this run. Don't change other creative settings such as profile, grain or vignette: those stay exactly the reference's.
 - `same_shoot`: the photo comes from the reference's own shoot (same camera and file type, taken within 3 hours). It keeps the reference's exposure and tone, with at most ±0.3 EV of correction, because the camera already evened out the light. Its `final_error` is high when its content differs (a close-up, more sky): that's expected.
   - Don't nudge its exposure by comparing one object's brightness (for example white paint L*) with the reference: different framing changes those numbers.
@@ -164,6 +175,7 @@ Every nudge you make, and every edit the user makes later in Lightroom, is learn
 Keep the report short:
 - **A table:** one row per photo with the file name, error before → after, any learned adjustment applied, any nudge you made and why (for example "skin looked green, Tint +4"), and flags.
 - **Grade**, for an exported reference: one line from `grade_fit`, for example "learned the edit from IMG_1964.JPG: off by 1.2 after fitting; blue sat +20, contrast +15".
+- **Grade**, for a reference from outside the catalog: one line from `style_grade`, for example "read the grade from the reference's pixels: saturation -24, contrast -20; look 3.6 → 2.5".
 - **Skin**, only with `--skin`: one line on how consistent it is across the set. Use the report's words (for example "DSC0042: greener than the reference, fixed").
 - **Flagged photos:** which photos have the yellow label, and why each needs the user's eye.
 - **What was learned:** one line, from `PY -m engine.learning show`. For example "learned from 2 edits you made last time; this camera's slider response now has 40 samples".

@@ -110,10 +110,10 @@ def test_find_original_by_name():
     assert find_original({"fileName": "IMG_1965.JPG"}, photos[:2]) is None  # not a copy of anything
 
 
-def test_without_the_original_colour_is_matched_conservatively(tmp_path):
+def test_without_the_original_colour_is_matched_conservatively_when_asked(tmp_path):
     lr = FakeLightroom({"ref": photo(baked(capture(sky_scene(0), 5500), BAKED_LOOK), "IMG_1964 copy.jpg"),
                         **scenes()}, active="ref")
-    report = run_match(lr, tmp_path, log=quiet)
+    report = run_match(lr, tmp_path, look_per_photo=True, log=quiet)
     assert report["grade_fit"] is None and report["options"]["look_per_photo"]
     assert any("original" in w for w in report["warnings"])
     for p in report["photos"]:
@@ -142,6 +142,7 @@ def test_band_missing_from_a_photo_is_left_alone(tmp_path):
     report = run_match(lr, tmp_path, log=quiet)
     (p,) = report["photos"]
     assert not any(k.endswith("Blue") for k in p["look_settings"])
+    assert not any(k.endswith("Blue") for k in report["style_grade"]["look_settings"])
 
 
 def test_reference_edited_in_lightroom_is_not_baked():
@@ -265,3 +266,91 @@ def test_a_brushed_edit_in_the_copy_is_found_and_outvoted(tmp_path):
     g = fit["look_settings"]
     assert g["SaturationAdjustmentOrange"] == pytest.approx(-30, abs=10)  # the real global edit survives
     assert all(abs(g.get(k, 0)) <= 60 for k in look.BAND_KEYS)
+
+
+# -- a reference from outside the catalog -----------------------------------------
+
+def outside_set(ref_scene=None, settings=BAKED_LOOK):
+    """Someone else's graded photo imported on its own: no sliders, no original."""
+    ref_scene = sky_scene(7) if ref_scene is None else ref_scene
+    return FakeLightroom({"ref": photo(baked(capture(ref_scene, 5500), settings), "pinterest_look.jpg"),
+                          **scenes()}, active="ref")
+
+
+def _closer_to_the_real_grade(lr, p, grade, real):
+    """How far the photo is from what the reference's real edit would have
+    made of it, with the copied grade and with no grade (same light)."""
+    st = lr.photos[p["id"]]["settings"]
+    light = {k: v for k, v in st.items() if k not in look.LOOK_KEYS}
+    light["Temperature"] = 1e6 / (1e6 / 5500 - float(light.get("Temperature", 0.0)))  # JPEG offset, as rendered
+    raw = lr.photos[p["id"]]["raw"]
+
+    def lab(extra):
+        return srgb_to_lab(render(raw, {**light, **extra}).reshape(-1, 3))
+    truth = lab(real)
+    return delta_e_2000(truth, lab(grade)).mean(), delta_e_2000(truth, lab({})).mean()
+
+
+def test_an_outside_reference_gives_one_grade_read_from_its_pixels(tmp_path):
+    lr = outside_set()
+    report = run_match(lr, tmp_path, log=quiet)
+    grade = report["style_grade"]
+    assert report["options"]["style_reference"] and report["grade_fit"] is None
+    assert not report["options"]["look_per_photo"]
+    assert any("original" in w for w in report["warnings"])
+    assert grade["error_after"] < grade["error_before"] and grade["note"]
+    g = grade["look_settings"]
+    # More than the old colour nudge: tone, saturation and colour toning too.
+    assert any(k in look.TONE_KEYS for k in g) and any(k.startswith("SplitToning") for k in g)
+    for p in report["photos"]:
+        on_photo = {k: v for k, v in lr.photos[p["id"]]["settings"].items() if k in look.LOOK_KEYS}
+        assert on_photo == g  # one grade for the whole set
+        copied, without = _closer_to_the_real_grade(lr, p, g, BAKED_LOOK)
+        assert copied < without * 0.7, (p["fileName"], copied, without)
+        assert p["look_final_error"] < p["look_start_error"]
+    assert report["reference"]["creative_look"] == {k: v for k, v in g.items()}
+
+
+def test_an_outside_reference_keeps_each_photos_brightness(tmp_path):
+    faded = {"Contrast2012": -20, "ParametricShadows": 30, "Saturation": -25,
+             "SplitToningHighlightHue": 40, "SplitToningHighlightSaturation": 20,
+             "SplitToningShadowHue": 210, "SplitToningShadowSaturation": 15}
+    lr = outside_set(sky_scene(8), faded)
+    report = run_match(lr, tmp_path, log=quiet)
+    g = report["style_grade"]["look_settings"]
+    assert g["Saturation"] < -10 and g["Contrast2012"] < 0  # a flat, muted look stays flat and muted
+    for p in report["photos"]:
+        copied, without = _closer_to_the_real_grade(lr, p, g, faded)
+        assert copied < without * 0.7, (p["fileName"], copied, without)
+        assert p["final_error"] < 2.0, p  # mid-tones held where the light stage put them
+
+
+def test_look_strength_scales_the_copied_grade(tmp_path):
+    full = run_match(outside_set(), tmp_path / "full", log=quiet)["style_grade"]["look_settings"]
+    half = run_match(outside_set(), tmp_path / "half", look_strength=0.5, log=quiet)["style_grade"]["look_settings"]
+    big = max((k for k in full if not k.startswith("SplitToning")), key=lambda k: abs(full[k]))
+    assert abs(half[big]) == pytest.approx(abs(full[big]) / 2, abs=1.0)
+
+
+def test_an_undone_outside_reference_run_is_not_learned(tmp_path):
+    from engine.learning import Learner
+    from engine.workflow import learn_from_run
+    lr = outside_set()
+    before = {pid: dict(p["settings"]) for pid, p in lr.photos.items()}
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lr, tmp_path / "run", learner=learner, log=quiet)
+    for pid, settings in before.items():
+        lr.photos[pid]["settings"] = dict(settings)
+    assert learn_from_run(lr, tmp_path / "run", learner, quiet) == 0
+    assert learner.data["corrections"] == 0
+
+
+def test_a_grade_nudge_after_an_outside_reference_goes_to_every_photo(tmp_path):
+    from engine.workflow import run_nudge
+    lr = outside_set()
+    report = run_match(lr, tmp_path, log=quiet)
+    before = report["style_grade"]["look_settings"].get("Contrast2012", 0.0)
+    run_nudge(lr, tmp_path, "all", {"Contrast2012": 5.0}, grade=True)
+    saved = json.loads((tmp_path / "report.json").read_text())
+    assert saved["style_grade"]["look_settings"]["Contrast2012"] == before + 5
+    assert all(lr.photos[pid]["settings"]["Contrast2012"] == before + 5 for pid in ("warm", "cool"))

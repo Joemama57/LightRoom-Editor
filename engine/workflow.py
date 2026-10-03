@@ -53,6 +53,7 @@ LOOK_ITERATIONS = 4
 PER_PHOTO_LOOK_LIMIT = 12.0
 SUBTITLE_CHARS = 58  # what fits under one contact-sheet tile
 PER_PHOTO_BAND_RATIO = 2.0
+STYLE_ITERATIONS = 6  # passes of the shared grade read from an outside reference
 # Photos from the reference's own shoot (same camera and file type, taken within
 # a few hours) were already evened out by the camera's auto-exposure. Matching
 # their brightness to the reference's would follow content instead (a close-up
@@ -311,10 +312,12 @@ def run_match(
     look: when the reference is an exported JPEG with its edit baked in (no
         creative settings to copy), recover the edit by fitting Lightroom
         settings that turn its unedited original into it (fit_grade), then
-        copy that grade to every photo. Without the original selected, fall
-        back to a small per-photo colour match (engine/look.py).
+        copy that grade to every photo. Without the original selected (a
+        photo from outside the catalog), read one grade from the reference's
+        pixels for the whole set (_match_style).
     look_strength: 0..1, how much of the fitted look to apply.
-    look_per_photo: force the per-photo colour match.
+    look_per_photo: use a small per-photo colour match (engine/look.py)
+        instead of the grade read from an outside reference's pixels.
     original: file name of the reference's unedited original (default: found
         by name among the selected photos).
     grades_dir: where fitted grades are kept for re-use (None: don't keep).
@@ -357,6 +360,7 @@ def run_match(
 
     baked = look and look_stage.is_baked(creative)
     grade_fit = None
+    style, style_grade = False, None
     shoot_ref = ref  # whose shoot, camera and light the targets are compared with
     if baked:
         source = find_original(ref, targets, original)
@@ -366,16 +370,24 @@ def run_match(
                                             out_dir, size, look_strength, warnings, log,
                                             grades_dir=grades_dir, refit=refit)
             shoot_ref = source
-        else:
-            look_per_photo = True
+        elif look_per_photo:
             msg = ("Couldn't find the unedited original of the reference among the selected photos; matching colour "
                    "conservatively. Select the original too for an exact match.")
+            warnings.append(msg)
+            log(msg)
+        else:
+            # A photo from outside the catalog: no sliders and no original to
+            # compare with. One grade is read from its pixels for the whole set.
+            style = True
+            msg = ("The reference has no Lightroom edits and its original isn't selected, so its grade is copied "
+                   "from its pixels (tone curve, saturation, colour toning). If it is your own export, select its "
+                   "original too for an exact copy.")
             warnings.append(msg)
             log(msg)
     per_photo_look = look and look_per_photo
     # A fitted grade sets the tone; each photo then only needs its white
     # balance and exposure, matched on neutrals and mid-tones.
-    light_only = grade_fit is not None and not color_only
+    light_only = (grade_fit is not None or style) and not color_only
     ref_offset = None if color_only else reference_wb_offset(ref, targets)
     if ref_offset and abs(ref_offset["mired"]) <= SAME_SHOOT_MIRED:
         ref_offset = None  # the reference is near what its camera saw: nothing to carry
@@ -529,6 +541,11 @@ def run_match(
 
     if per_photo_look:
         _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint)
+    if style:
+        creative, style_grade = _match_style(bridge, state, creative, ref_path, out_dir, size, look_strength,
+                                             warnings, log, hint)
+        for s in state.values():
+            s["before_look"] = _look_fingerprint(s["photo"].get("settings") or {}, creative)
 
     for s in state.values():
         o = s["options"]
@@ -565,8 +582,9 @@ def run_match(
         "size": size,
         "options": {"skin": skin, "color_only": color_only, "learning": learner is not None,
                     "look": look, "look_strength": look_strength, "look_per_photo": per_photo_look,
-                    "light_only": light_only},
+                    "light_only": light_only, "style_reference": style},
         "grade_fit": grade_fit,
+        "style_grade": style_grade,
         "reference_wb_offset": ref_offset,
         "baked_reference": bool(baked),
         # To recognise an undone run later (see _was_undone).
@@ -1187,6 +1205,77 @@ def _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength,
                                                                 s["look_plan"]), 2)
 
 
+def _match_style(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint):
+    """One grade for every photo, read from an outside reference's pixels
+    (engine/look.py propose_style). Each photo's light was matched first; the
+    grade adds the reference's tone curve shape, saturation, shadow and
+    highlight tint, and the colour families the photos share with it.
+    Returns the creative settings with the grade, and a summary for the report."""
+    ref_look = look_stage.measure_look_file(ref_path)
+    bases, plans, masks = {}, {}, {}
+    for pid, s in state.items():
+        bases[pid], masks[pid] = look_stage.measure_look_file_with_masks(s["preview"])
+        # A blown-out frame has nothing to read; it still gets the grade.
+        if s["final_metrics"].clipped_fraction <= MOSTLY_CLIPPED:
+            plans[pid] = look_stage.make_plan(ref_look, bases[pid], tone=True, split=True, skin=s["options"].skin,
+                                              max_ratio=PER_PHOTO_BAND_RATIO)
+    if not plans:
+        return creative, None
+    history = [{"offsets": {}, "looks": {pid: bases[pid] for pid in plans},
+                "previews": {pid: (s["preview"], s["final_metrics"]) for pid, s in state.items()}}]
+    iteration = 0
+    while True:
+        p = look_stage.propose_style(ref_look, bases, plans, history, tolerance=LOOK_TOLERANCE,
+                                     max_iterations=STYLE_ITERATIONS)
+        if p.done:
+            break
+        log(f"Grade pass {iteration + 1}: copying the reference's tone and colour onto {len(state)} photo(s)")
+        settings = look_stage.to_settings(p.offsets, creative, split_limit=look_stage.STYLE_SPLIT_LIMIT)
+        _apply(bridge, [{"id": pid, "settings": settings} for pid in state], warnings, log)
+        it_dir = out_dir / f"grade_{iteration}"
+        it_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(it_dir / f"{_safe(s['photo'])}.jpg")} for pid, s in state.items()]
+        bridge.render(items, size=size)
+        entry = {"offsets": p.offsets, "looks": {}, "previews": {}}
+        for item in items:
+            pid = item["id"]
+            entry["previews"][pid] = (item["path"], measure_file(item["path"], hint))
+            if pid in plans:
+                entry["looks"][pid] = look_stage.measure_look_file(item["path"], masks[pid])
+        history.append(entry)
+        iteration += 1
+
+    offsets = {k: float(round(v * look_strength)) for k, v in p.offsets.items()}
+    grade = look_stage.to_settings(offsets, creative, split_limit=look_stage.STYLE_SPLIT_LIMIT)
+    final = next((h for h in history if _same_offsets(h["offsets"], offsets)), None)
+    _apply(bridge, [{"id": pid, "settings": grade} for pid in state], warnings, log)
+    if final is None:
+        final_dir = out_dir / "grade_final"
+        final_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(final_dir / f"{_safe(s['photo'])}.jpg")} for pid, s in state.items()]
+        bridge.render(items, size=size)
+        final = {"looks": {}, "previews": {}}
+        for item in items:
+            final["previews"][item["id"]] = (item["path"], measure_file(item["path"], hint))
+            if item["id"] in plans:
+                final["looks"][item["id"]] = look_stage.measure_look_file(item["path"], masks[item["id"]])
+    errors_before, errors_after = [], []
+    for pid, s in state.items():
+        s["preview"], s["final_metrics"] = final["previews"][pid]
+        if pid in plans:
+            s["look_start_error"] = round(look_stage.style_error(ref_look, bases[pid], bases[pid], plans[pid]), 2)
+            s["look_final_error"] = round(look_stage.style_error(ref_look, bases[pid], final["looks"][pid],
+                                                                 plans[pid]), 2)
+            errors_before.append(s["look_start_error"])
+            errors_after.append(s["look_final_error"])
+    note = look_stage.describe(offsets) or None
+    log(f"Grade copied from the reference: {note or 'little to change'}")
+    summary = {"look_settings": grade, "note": note, "limited": p.limited,
+               "error_before": round(float(np.mean(errors_before)), 2),
+               "error_after": round(float(np.mean(errors_after)), 2)}
+    return {**creative, **grade}, summary
+
+
 def _same_offsets(a, b):
     return all(abs(a.get(k, 0.0) - b.get(k, 0.0)) < 0.05 for k in set(a) | set(b))
 
@@ -1210,6 +1299,9 @@ def _tiles(report, key):
     fit = report.get("grade_fit")
     if fit and fit.get("delta_e_after") is not None and key == "preview":
         tiles[0]["subtitle"] = f"grade learned from {fit['original']} (off by {fit['delta_e_after']:.1f})"
+    style = report.get("style_grade")
+    if style and key == "preview":
+        tiles[0]["subtitle"] = _subtitle("grade read from its pixels", [style["note"]] if style.get("note") else [])
     for p in report["photos"]:
         err = p["start_error"] if key == "start_preview" else p["final_error"]
         flags = [f for f in p["flags"] if key == "preview" or f not in REVIEW_FLAGS]
@@ -1398,6 +1490,10 @@ def _correct_grade(report, changes, grades_dir):
         for key, delta in changes.items():
             fit.setdefault("look_settings", {})[key] = base[key]
         fit.setdefault("corrections", []).append(dict(changes, date=time.strftime("%Y-%m-%d")))
+    style = report.get("style_grade")
+    if style:
+        for key in changes:
+            style.setdefault("look_settings", {})[key] = base[key]
     if grades_dir:
         cache = Path(grades_dir) / f"{_stem(report['reference'].get('fileName')) or 'reference'}.json"
         if cache.exists():
@@ -1497,7 +1593,8 @@ def main(argv=None):
                    help="match light only (white balance, exposure, tone); skip matching colour and contrast")
     m.add_argument("--look-strength", type=float, default=1.0, help="0..1, how much of the look matching to apply")
     m.add_argument("--look-per-photo", action="store_true",
-                   help="also nudge each photo's colours toward the reference's (small, per photo)")
+                   help="also nudge each photo's colours toward the reference's (small, per photo); for a "
+                        "reference from outside the catalog, use this instead of copying one grade")
     m.add_argument("--original", help="file name of the reference's unedited original, if not found by name")
     m.add_argument("--refit", action="store_true", help="learn an exported reference's grade again")
     m.add_argument("--tolerance", type=float, default=2.0)
@@ -1574,6 +1671,7 @@ def _summary(report):
         "baked_reference": report.get("baked_reference"),
         "grade_fit": {k: v for k, v in (report.get("grade_fit") or {}).items() if k not in ("look_settings", "light")}
         or None,
+        "style_grade": report.get("style_grade"),
         "reference_skin": report["reference"].get("skin") if skin_on else None,
         "contact_sheet": report["contact_sheet"],
         "contact_sheet_before": report["contact_sheet_before"],

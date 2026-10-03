@@ -15,8 +15,9 @@ Grade one photo, select the rest, and run `/match-look` in Claude Code. Every se
   - The fit measures how your Lightroom responds to each slider (about 30–40 renders of one photo). The result is kept in `~/.matchlook/grades/` and reused next time; `--refit` learns it again.
   - Local edits in the copy (masks, brushes) can't be reproduced by global sliders. The report's `grade_fit.delta_e_after` shows how close the fit got.
   - With a fitted grade, each photo only gets its white balance and exposure solved.
-  - Without the original, it falls back to a small per-photo colour match.
+  - Without the original, see the next point.
   - `--look-strength 0.5` applies half the grade. `--no-look` skips it.
+- **A reference from outside the catalog** (someone else's photo, or any picture with no Lightroom edits and no original): import it, click it as the reference and run as usual. Match Look reads one grade from its pixels (the ends of its tone curve, contrast, saturation, the tint of its shadows and highlights, the colours it shares with your photos) and puts that same grade on every photo, after matching each photo's white balance and exposure. It works best when the reference shows a similar kind of scene. `--look-strength 0.5` applies half of it; `--look-per-photo` uses the older small per-photo colour match instead.
 - **Skin tones (`--skin`):** a skin model built from 14,532 measured skin colours across 8 populations keeps skin consistent and describes each photo's skin in words. See [docs/SKIN_TONES.md](docs/SKIN_TONES.md).
 - **Keep each photo's brightness (`--color-only`):** matches colour only, for deliberately dark or bright frames.
 - **Self-learning:**
