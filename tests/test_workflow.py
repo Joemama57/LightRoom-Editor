@@ -574,3 +574,53 @@ def test_learning_ignores_photos_of_another_catalog(lightroom, tmp_path):
     assert learner.data["preference"] == {}
     assert "learned" not in json.loads((tmp_path / "run" / "report.json").read_text())  # learnable later from its own catalog
     assert any("aren't in the open catalog" in m for m in messages)
+
+
+def _stage(ref_kelvin, frames):
+    """A reference under 3000 K stage light, graded at ref_kelvin, and frames
+    {id: (seconds after the reference, camera As Shot Kelvin)} under the same light."""
+    ref = photo(capture(make_scene(seed=0), 3000), "DSC1303.ARW",
+                settings={**REF_SETTINGS, "Temperature": ref_kelvin})
+    ref["captureTime"] = 0.0
+    photos = {"ref": ref}
+    for n, (pid, (seconds, as_shot)) in enumerate(frames.items()):
+        p = photo(capture(make_scene(seed=n + 1)[4:, 2:], 3000), f"DSC13{n + 10}.ARW",
+                  settings={"WhiteBalance": "As Shot", "Temperature": as_shot, "Tint": 0})
+        p["captureTime"] = seconds
+        photos[pid] = p
+    return FakeLightroom(photos, active="ref")
+
+
+def _mired(kelvin):
+    return 1e6 / kelvin
+
+
+def test_the_references_own_white_balance_choice_is_carried_to_its_shoot(tmp_path):
+    report = run_match(_stage(3000, {"mate": (30.0, 5500)}), tmp_path, log=quiet)
+    assert report["reference_wb_offset"]["from"] == "DSC1310.ARW"
+    (p,) = report["photos"]
+    assert "wb_offset_from_reference" in p["flags"]
+    assert abs(_mired(p["start"]["Temperature"]) - _mired(3000)) < 1  # its camera reading plus the reference's offset
+    assert abs(_mired(p["final"]["Temperature"]) - _mired(3000)) <= 20
+
+
+def test_a_later_photo_can_reach_the_references_white_balance(tmp_path):
+    report = run_match(_stage(3000, {"mate": (30.0, 5500), "later": (4 * 3600.0, 5500)}), tmp_path, log=quiet)
+    later = next(p for p in report["photos"] if p["id"] == "later")
+    assert "wb_offset_from_reference" not in later["flags"]
+    assert later["start"]["Temperature"] == 5500  # its own camera reading
+    assert _mired(later["final"]["Temperature"]) - _mired(5500) > 80  # past the usual limit, toward 3000 K
+
+
+def test_a_reference_near_its_camera_reading_carries_nothing(tmp_path):
+    report = run_match(_stage(5500, {"mate": (30.0, 5600)}), tmp_path, log=quiet)
+    assert report["reference_wb_offset"] is None
+    (p,) = report["photos"]
+    assert p["start"]["Temperature"] == 5600 and "wb_offset_from_reference" not in p["flags"]
+
+
+def test_without_a_photo_from_the_references_minutes_nothing_is_carried(tmp_path):
+    report = run_match(_stage(3000, {"later": (4 * 3600.0, 5500)}), tmp_path, log=quiet)
+    assert report["reference_wb_offset"] is None
+    (p,) = report["photos"]
+    assert abs(_mired(p["final"]["Temperature"]) - _mired(5500)) <= 80 + 0.5  # the usual limit

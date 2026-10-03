@@ -37,7 +37,7 @@ from .guards import MOSTLY_CLIPPED, different_scene, flags_for
 from .learning import Learner, light_bucket, same_light
 from .colorspace import delta_e_2000, srgb_to_lab
 from .measure import Metrics, load_image, measure_file
-from .settings import is_raw, split, starting_corrective
+from .settings import camera_white_balance, is_raw, split, starting_corrective
 from .solver import (CORRECTIVE, MIN_SKIN_FRACTION, Options, _to_internal, _to_sliders, at_tone_limit, blend, clamp,
                      match_error, propose, wb_limits)
 
@@ -69,6 +69,11 @@ SAME_SHOOT_TINT = 10.0
 # shoot's move instead.
 SHOOT_OUTLIER_MIRED = 20.0
 SHOOT_OUTLIER_MIN_PHOTOS = 3
+# Lightroom doesn't keep a raw's as-shot white balance once it is changed, so the
+# reference's is read off a photo shot within these minutes with the same camera
+# (same light). When the reference was set more than SAME_SHOOT_MIRED away from
+# it, that is the user's choice, and it is carried to the other photos.
+REF_AS_SHOT_MINUTES = 10.0
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -360,6 +365,12 @@ def run_match(
     # A fitted grade sets the tone; each photo then only needs its white
     # balance and exposure, matched on neutrals and mid-tones.
     light_only = grade_fit is not None and not color_only
+    ref_offset = None if color_only else reference_wb_offset(ref, targets)
+    if ref_offset and abs(ref_offset["mired"]) <= SAME_SHOOT_MIRED:
+        ref_offset = None  # the reference is near what its camera saw: nothing to carry
+    if ref_offset:
+        log(f"Reference white balance is {ref_offset['mired']:+.0f} mired, Tint {ref_offset['tint']:+.0f} from the "
+            f"camera's (read off {ref_offset['from']}); carrying that to the photos")
 
     state = {}
     for t in targets:
@@ -378,6 +389,18 @@ def run_match(
             limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
         else:
             tone_limits = Options().tone_limits
+        offset_applied = False
+        if ref_offset and t_raw and wb_from_camera and camera == ref.get("cameraModel"):
+            if _shot_together(ref, t, REF_AS_SHOT_MINUTES / 60):
+                # Same light as the reference: the user's white-balance choice, from its own camera reading.
+                x = _to_internal(start, True)
+                x[0], x[1] = x[0] + ref_offset["mired"], x[1] + ref_offset["tint"]
+                start = {**start, **{k: _to_sliders(x, True)[k] for k in ("Temperature", "Tint")}}
+                offset_applied = True
+            else:
+                # Other light: its own camera reading, but free to reach the reference's choice.
+                gap = abs(1e6 / float(ref["settings"]["Temperature"]) - 1e6 / start["Temperature"])
+                limits_wb = (max(limits_wb[0], gap + SAME_SHOOT_MIRED), limits_wb[1])
         if shoot and grade_fit and grade_fit.get("light"):
             # The original's own light, as fitted: the copy's sliders don't carry it.
             for key in CORRECTIVE[2:]:
@@ -394,6 +417,8 @@ def run_match(
             flags.append("different_file_type")
         if shoot or other_format:
             flags.append("same_shoot")
+        if offset_applied:
+            flags.append("wb_offset_from_reference")
         own = t.get("settings") or {}
         state[t["id"]] = {
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
@@ -528,6 +553,7 @@ def run_match(
                     "look": look, "look_strength": look_strength, "look_per_photo": per_photo_look,
                     "light_only": light_only},
         "grade_fit": grade_fit,
+        "reference_wb_offset": ref_offset,
         "baked_reference": bool(baked),
         # To recognise an undone run later (see _was_undone).
         "look_keys": sorted(creative),
@@ -603,15 +629,40 @@ def _stem(name):
     return EXPORT_SUFFIX.sub("", stem).strip().lower()
 
 
-def _shot_together(ref, target):
-    """Same camera, capture times within SAME_SHOOT_HOURS. Without capture
-    times it can't tell, so it says no."""
+def _shot_together(ref, target, hours=SAME_SHOOT_HOURS):
+    """Same camera, capture times within `hours`. Without capture times it
+    can't tell, so it says no."""
     a, b = ref.get("captureTime"), target.get("captureTime")
     if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
         return False
     if not ref.get("cameraModel") or ref.get("cameraModel") != target.get("cameraModel"):
         return False
-    return abs(a - b) <= SAME_SHOOT_HOURS * 3600
+    return abs(a - b) <= hours * 3600
+
+
+def reference_wb_offset(ref, targets):
+    """How far the reference's white balance was set from what its camera saw:
+    {"mired", "tint", "from"} (reference minus camera), or None when it can't
+    tell. The camera's reading comes from the photo shot closest to the
+    reference, within REF_AS_SHOT_MINUTES, with the same camera, still on As Shot."""
+    settings = ref.get("settings") or {}
+    if not is_raw(ref) or settings.get("WhiteBalance") == "As Shot" or not settings.get("Temperature"):
+        return None
+    best = None
+    for t in targets:
+        camera = camera_white_balance(t.get("settings"), is_raw(t))
+        if camera and _shot_together(ref, t, REF_AS_SHOT_MINUTES / 60):
+            gap = abs(t["captureTime"] - ref["captureTime"])
+            if best is None or gap < best[0]:
+                best = (gap, t, camera)
+    if best is None:
+        return None
+    _, t, camera = best
+    return {
+        "mired": round(1e6 / float(settings["Temperature"]) - 1e6 / camera["Temperature"], 1),
+        "tint": round(float(settings.get("Tint", 0.0)) - camera["Tint"], 1),
+        "from": t["fileName"],
+    }
 
 
 def same_shoot(ref, target):
