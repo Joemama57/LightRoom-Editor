@@ -1,5 +1,25 @@
 # White balance
 
+## 2026-10-03 — Raw close-ups end at Tint +22 to +24 and the white paint reads pink
+Source: run 20261003-163645 (reference `IMG_1963.JPG`, edited in Lightroom, no grade fit), `IMG_1982.DNG`, `IMG_1983.DNG`, `IMG_1987.DNG` (`iter_6/`, `final/`, `nudges/00_`–`02_`); brightest 15% of each preview, median CIELAB
+Finding: The three DNG close-ups were solved to Tint +21.8, +23.6 and +24.3
+(Temperature 6800–7950) and stayed `not_converged` at errors 11.7–13.2. Their
+white paint measured a +4.9, +8.0 and +7.0, against +1.0 on the reference and
++3.3 to +4.4 on the JPEG close-ups of the same panels (`IMG_1967.JPG`,
+`IMG_1969.JPG`, `IMG_1970.JPG`). `Tint=-6` on each lowered a by 1.2–1.4 (to
++3.7, +6.8, +5.6), left b and L unchanged and moved the error by 0.2 or less.
+Changed by run 20261003-165410 (after commit 868a48e caps raw Tint at ±10 for
+a JPEG reference's shoot): the same three DNGs ended at Tint +10.0, +3.7 and
++10.0, and their paint measured a +2.4, +4.6 and +3.4, against +4.0 to +4.4 on
+the JPEG close-ups (`IMG_1969.JPG`, `IMG_1970.JPG`, `IMG_1980.JPG`). No Tint
+nudge was needed.
+Takeaway: The rule below applies only if a raw close-up ends above Tint +20,
+which the cap now prevents for same-shoot sets. On a raw close-up of white paint with Tint above +20, measure the
+paint's a against the JPEG close-ups; if it is 3 or more higher, nudge Tint −6
+in the first round. Expect about 1.3 of a per 6 of Tint, so `IMG_1983.DNG` and
+`IMG_1987.DNG` need a second round to reach the JPEGs. The nudge is learned as
+a raw preference at the next run (nudges.md): say so in the report.
+
 ## 2026-10-03 — JPEG white balance must go through the incremental sliders
 Source: run 20261003-122807 (10 JPEGs ended at Temperature +100, Tint ±40, all `mostly_clipped`); session 7324522b; uncommitted change in `engine/bridge.py`
 Finding: Lightroom Classic 15 keeps white balance for JPEGs in

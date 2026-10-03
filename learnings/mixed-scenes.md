@@ -1,5 +1,26 @@
 # Mixed scenes and mixed file types
 
+## 2026-10-03 — Raw files against a Lightroom-edited JPEG reference mostly do not converge
+Source: run 20261003-163645 (reference `IMG_1963.JPG`, look copied from its Lightroom settings, full light stage), 11 DNGs and 19 JPEGs
+Finding: 9 of the 11 DNGs ended `not_converged` after 7 passes, with errors of
+0.8–13.2 (start 4.0–20.2); the three above 11 are close-ups (`IMG_1982`,
+`IMG_1983`, `IMG_1987`). Of the 19 `same_shoot` JPEGs, 3 were `not_converged`
+and errors ended at 1.3–15.3, the highest on close-ups (`IMG_1980.JPG` 15.3,
+`IMG_1974.JPG` 12.3, `IMG_1970.JPG` 10.4). `IMG_1988.DNG` was `tone_limited`
+with Highlights, Shadows and Whites at +40 and Blacks at −40. This differs
+from the entry below, where three DNGs under a fitted grade with light-only
+solving ended at 1.0–2.9.
+Changed by run 20261003-165410 (same selection and reference, after commit
+868a48e): the 11 DNGs now carry `same_shoot` with `different_file_type`, all
+ended with the four tone sliders at 0, and 9 of 11 ended at Tint +10.0 (the
+cap). 4 of 11 were `not_converged` (`IMG_1981`, and the close-ups `IMG_1982`,
+`IMG_1983`, `IMG_1987` at 12.2–14.0); the other 7 ended at 2.7–5.6. No frame
+was `tone_limited`. The 19 JPEGs ended within 0.7 of the earlier run.
+Takeaway: With a Lightroom-edited JPEG reference and raw files from its shoot,
+expect the yellow label on the raw close-ups only. Name them in the report,
+and suggest a graded DNG as reference for the raw files if the user wants them
+tighter. A raw Tint of exactly +10.0 is the cap, not a solved value.
+
 ## 2026-10-03 — Exteriors and LED-lit interiors do not share a reference
 Source: runs 20261003-122807, 20261003-123319 and 20261003-124236 (24 photos: sunset exteriors plus interior DNGs `IMG_1990`–`IMG_2001`); commit 0e6aab8
 Finding: With one daylight exterior as reference, the interior DNGs started
