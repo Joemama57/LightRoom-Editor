@@ -472,3 +472,31 @@ def test_other_shoots_are_matched_on_brightness(tmp_path, time, camera):
     (p,) = report["photos"]
     assert "same_shoot" not in p["flags"]
     assert p["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"] - 0.3  # the brighter content is pulled down
+
+
+def _jpeg_ref_and_raw(target_time):
+    """A JPEG reference and a raw file of a contrastier, tinted frame from the same camera."""
+    scene = make_scene(seed=0)
+    ref_settings = {**REF_SETTINGS, "Temperature": 0, "Tint": 0}
+    ref = photo(capture(scene, 5500), "IMG_0001.JPG", fmt="JPG", settings=ref_settings)
+    raw = photo(capture(scene ** 1.6, 5500, 25), "IMG_0002.DNG")
+    ref["captureTime"], raw["captureTime"] = 0.0, target_time
+    return FakeLightroom({"ref": ref, "raw": raw}, active="ref")
+
+
+def test_a_raw_file_from_a_jpeg_references_shoot_is_held_close(tmp_path):
+    report = run_match(_jpeg_ref_and_raw(600.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert {"same_shoot", "different_file_type"} <= set(p["flags"])
+    assert "tone_limited" not in p["flags"]
+    for key in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"):
+        assert abs(p["final"][key] - p["start"][key]) <= 15 + 1e-6, key
+    assert abs(p["final"]["Tint"] - p["start"]["Tint"]) <= 10 + 1e-6
+
+
+def test_a_raw_file_from_another_shoot_keeps_the_wide_limits(tmp_path):
+    report = run_match(_jpeg_ref_and_raw(5 * 3600.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" not in p["flags"] and "different_file_type" in p["flags"]
+    moved = max(abs(p["final"][k] - p["start"][k]) for k in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"))
+    assert moved > 15 or abs(p["final"]["Tint"] - p["start"]["Tint"]) > 10  # what the held-close photo is spared

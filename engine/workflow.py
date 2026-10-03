@@ -59,6 +59,12 @@ PER_PHOTO_BAND_RATIO = 2.0
 # tone, with only a small exposure correction.
 SAME_SHOOT_HOURS = 3.0
 SAME_SHOOT_EV = 0.3
+# A raw file from the shoot of a JPEG reference (or the other way round) renders
+# very differently: the JPEG has the camera's tone mapping baked in. Its light is
+# still solved, but tone and tint stay close: the light was the same, so a big
+# swing is the other format's rendering or content, not light.
+SHOOT_OTHER_FORMAT_TONE = 15.0
+SHOOT_OTHER_FORMAT_TINT = 10.0
 # Grade fit on the reference's original (same pixels, so it can move further).
 GRADE_LIGHT_ITERATIONS = 8
 GRADE_LOOK_ITERATIONS = 8
@@ -343,7 +349,15 @@ def run_match(
         camera = t.get("cameraModel")
         start, wb_from_camera = starting_corrective(ref_corrective, ref_raw, t_raw, t.get("settings"))
         shoot = not color_only and same_shoot(shoot_ref, t)
-        tone_limits = (SAME_SHOOT_EV, 0.0) if shoot else Options().tone_limits
+        other_format = not color_only and same_shoot_other_format(shoot_ref, t)
+        limits_wb = wb_limits(t_raw, wb_from_camera)
+        if shoot:
+            tone_limits = (SAME_SHOOT_EV, 0.0)
+        elif other_format:
+            tone_limits = (Options().tone_limits[0], SHOOT_OTHER_FORMAT_TONE)
+            limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
+        else:
+            tone_limits = Options().tone_limits
         if shoot and grade_fit and grade_fit.get("light"):
             # The original's own light, as fitted: the copy's sliders don't carry it.
             for key in CORRECTIVE[2:]:
@@ -358,7 +372,7 @@ def run_match(
             flags.append("different_camera")
         if t_raw != ref_raw:
             flags.append("different_file_type")
-        if shoot:
+        if shoot or other_format:
             flags.append("same_shoot")
         own = t.get("settings") or {}
         state[t["id"]] = {
@@ -369,9 +383,8 @@ def run_match(
             "before_look": _look_fingerprint(own, creative),
             "wb_from_camera": wb_from_camera,
             "options": Options(prior=prior, skin=skin, color_only=color_only,
-                               wb_limits=wb_limits(t_raw, wb_from_camera), light_only=light_only,
-                               tone_limits=tone_limits),
-            "same_shoot": shoot,
+                               wb_limits=limits_wb, light_only=light_only, tone_limits=tone_limits),
+            "same_shoot": shoot or other_format,
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
         }
@@ -540,16 +553,26 @@ def _stem(name):
     return EXPORT_SUFFIX.sub("", stem).strip().lower()
 
 
-def same_shoot(ref, target):
-    """True when `target` comes from the same shoot as `ref`: same camera and
-    file type, and capture times within SAME_SHOOT_HOURS. Without capture
+def _shot_together(ref, target):
+    """Same camera, capture times within SAME_SHOOT_HOURS. Without capture
     times it can't tell, so it says no."""
     a, b = ref.get("captureTime"), target.get("captureTime")
     if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
         return False
     if not ref.get("cameraModel") or ref.get("cameraModel") != target.get("cameraModel"):
         return False
-    return is_raw(ref) == is_raw(target) and abs(a - b) <= SAME_SHOOT_HOURS * 3600
+    return abs(a - b) <= SAME_SHOOT_HOURS * 3600
+
+
+def same_shoot(ref, target):
+    """True when `target` comes from the same shoot as `ref`, in the same file type."""
+    return _shot_together(ref, target) and is_raw(ref) == is_raw(target)
+
+
+def same_shoot_other_format(ref, target):
+    """True when `target` comes from the same shoot as `ref`, in the other file
+    type (a DNG next to a JPEG reference)."""
+    return _shot_together(ref, target) and is_raw(ref) != is_raw(target)
 
 
 def find_original(ref, photos, name=None):

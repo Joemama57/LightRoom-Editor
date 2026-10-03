@@ -145,6 +145,7 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 - `same_shoot`: the photo comes from the reference's own shoot (same camera and file type, taken within 3 hours). It keeps the reference's exposure and tone, with at most ±0.3 EV of correction, because the camera already evened out the light. Its `final_error` is high when its content differs (a close-up, more sky): that's expected.
   - Don't nudge its exposure by comparing one object's brightness (for example white paint L*) with the reference: different framing changes those numbers.
   - Only nudge its exposure if it clearly looks darker or brighter than the reference on the contact sheet, by at most ±0.3, and say why.
+  - A raw file from a JPEG reference's shoot (or the other way round) carries both `same_shoot` and `different_file_type`. Its light is solved, but its tone sliders stay within ±15 and its Tint within ±10, because the two formats render differently. Judge its white paint by eye, and nudge Tint by at most ±6.
 - **When the user approves some photos and not others:** if the approved ones carry a look nudge the others lack, apply that same change to the whole set and to the stored grade with one command, instead of nudging photos one by one:
   ```
   PY -m engine.workflow nudge --run RUN --photo all --grade HueAdjustmentOrange=-20 HueAdjustmentYellow=-20
