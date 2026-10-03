@@ -38,7 +38,8 @@ from .learning import Learner, light_bucket, same_light
 from .colorspace import delta_e_2000, srgb_to_lab
 from .measure import Metrics, load_image, measure_file
 from .settings import is_raw, split, starting_corrective
-from .solver import CORRECTIVE, MIN_SKIN_FRACTION, Options, at_tone_limit, blend, clamp, match_error, propose, wb_limits
+from .solver import (CORRECTIVE, MIN_SKIN_FRACTION, Options, _to_internal, _to_sliders, at_tone_limit, blend, clamp,
+                     match_error, propose, wb_limits)
 
 RUNS_DIR = Path.home() / ".matchlook" / "runs"
 SNAPSHOT_NAME = "Before Match Look"
@@ -59,6 +60,15 @@ PER_PHOTO_BAND_RATIO = 2.0
 # tone, with only a small exposure correction.
 SAME_SHOOT_HOURS = 3.0
 SAME_SHOOT_EV = 0.3
+# Their light was the same too, so a raw's white balance stays near the camera's:
+# a bigger swing follows content (a yellow saree, an orange wall), not light.
+SAME_SHOOT_MIRED = 20.0
+SAME_SHOOT_TINT = 10.0
+# With a few raws from the shoot, one whose white-balance move is more than this (in
+# mired) from the shoot's median move was fooled by its content: it gets the
+# shoot's move instead.
+SHOOT_OUTLIER_MIRED = 20.0
+SHOOT_OUTLIER_MIN_PHOTOS = 3
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -214,10 +224,18 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
         _mark_learned(run_dir, report, f"skipped: {reason}")
         log(f"Not learning from {run_dir.name}: {reason}")
         return 0
+    names = {p["id"]: p.get("fileName") for p in report["photos"]}
     try:
-        current = {c["id"]: c["settings"] for c in bridge.get_settings([{"id": p["id"]} for p in report["photos"]])}
+        found = bridge.get_settings([{"id": p["id"]} for p in report["photos"]])
     except BridgeError as e:
         log(f"Couldn't read last run's photos to learn from them: {e}")
+        return 0
+    # Ids are local to a catalog: in another catalog the same id is another photo.
+    current = {c["id"]: c["settings"] for c in found
+               if not c.get("fileName") or not names.get(c["id"]) or c["fileName"] == names[c["id"]]}
+    if report["photos"] and not current:
+        # Left unmarked: `learn --run` with its catalog open can still learn from it.
+        log(f"Not learning from {run_dir.name}: its photos aren't in the open catalog")
         return 0
     candidates, undone = [], 0
     for p in report["photos"]:
@@ -353,6 +371,8 @@ def run_match(
         limits_wb = wb_limits(t_raw, wb_from_camera)
         if shoot:
             tone_limits = (SAME_SHOOT_EV, 0.0)
+            if t_raw and wb_from_camera:
+                limits_wb = (min(limits_wb[0], SAME_SHOOT_MIRED), min(limits_wb[1], SAME_SHOOT_TINT))
         elif other_format:
             tone_limits = (Options().tone_limits[0], SHOOT_OTHER_FORMAT_TONE)
             limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
@@ -385,6 +405,7 @@ def run_match(
             "options": Options(prior=prior, skin=skin, color_only=color_only,
                                wb_limits=limits_wb, light_only=light_only, tone_limits=tone_limits),
             "same_shoot": shoot or other_format,
+            "shoot_wb": shoot and t_raw and wb_from_camera,
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
         }
@@ -434,14 +455,18 @@ def run_match(
 
     # Final values: best render found, scaled by strength, plus anything learned
     # about your taste for this camera and kind of light.
+    for s in state.values():
+        s["matched"] = blend(s["start"], s["proposal"].sliders, strength, s["is_raw"])
+    _pull_shoot_outliers(state, log)
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
         errors = [match_error(ref_metrics, h["metrics"], skin=o.skin, color_only=o.color_only,
                               light_only=o.light_only) for h in s["history"]]
         best = min(range(len(errors)), key=errors.__getitem__)
-        matched = blend(s["start"], p.sliders, strength, s["is_raw"])
-        s["light"] = light_bucket(p.sliders, s["is_raw"])
+        matched = s["matched"]
+        pulled = "wb_from_shoot" in s["extra_flags"]
+        s["light"] = light_bucket(matched if pulled else p.sliders, s["is_raw"])
         final, learned = matched, None
         if learner is not None:
             final, learned = learner.apply_preference(matched, s["camera"], s["is_raw"], s["light"])
@@ -546,6 +571,31 @@ def run_match(
     _label_flagged(bridge, report, label)
     _write_outputs(out_dir, report)
     return report
+
+
+def _pull_shoot_outliers(state, log=print):
+    """Raws from the reference's shoot share its light, so their white balance
+    should move alike. One whose move is far from the shoot's median move
+    followed its content instead: give it the shoot's move (from its own
+    camera white balance) and flag it wb_from_shoot."""
+    shoot = [s for s in state.values() if s.get("shoot_wb")]
+    if len(shoot) < SHOOT_OUTLIER_MIN_PHOTOS:
+        return
+    moves = {}
+    for s in shoot:
+        x0, x1 = _to_internal(s["start"], True), _to_internal(s["matched"], True)
+        moves[id(s)] = (x1[0] - x0[0], x1[1] - x0[1])
+    median_temp = float(np.median([m[0] for m in moves.values()]))
+    median_tint = float(np.median([m[1] for m in moves.values()]))
+    for s in shoot:
+        if abs(moves[id(s)][0] - median_temp) <= SHOOT_OUTLIER_MIRED:
+            continue
+        x = _to_internal(s["matched"], True)
+        x0 = _to_internal(s["start"], True)
+        x[0], x[1] = x0[0] + median_temp, x0[1] + median_tint
+        s["matched"] = _to_sliders(x, True)
+        s["extra_flags"].append("wb_from_shoot")
+        log(f"{s['photo']['fileName']}: white balance followed the content; using the shoot's instead")
 
 
 def _stem(name):

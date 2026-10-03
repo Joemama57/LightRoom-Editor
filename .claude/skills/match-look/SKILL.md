@@ -146,6 +146,9 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
   - Don't nudge its exposure by comparing one object's brightness (for example white paint L*) with the reference: different framing changes those numbers.
   - Only nudge its exposure if it clearly looks darker or brighter than the reference on the contact sheet, by at most ±0.3, and say why.
   - A raw file from a JPEG reference's shoot (or the other way round) carries both `same_shoot` and `different_file_type`. Its light is solved, but its tone sliders stay within ±15 and its Tint within ±10, because the two formats render differently. Judge its white paint by eye, and nudge Tint by at most ±6.
+  - A raw `same_shoot` photo whose white balance came from the camera keeps it within ±20 mired and Tint ±10, because the light was the same.
+  - `wb_from_shoot`: with 3 or more raws from the shoot, this photo's own white-balance solve moved far from the rest (it followed its content, such as a yellow saree or an orange wall), so it got the shoot's median move instead. Check a neutral surface (a white wall) against the reference before nudging, and nudge Temperature only if that surface is off.
+- A log line saying the previous run's photos aren't in the open catalog is expected after the user switches catalogs. It is not a fault: that run isn't learned from. To learn from it, reopen its catalog and run `PY -m engine.workflow learn --run RUN`.
 - **When the user approves some photos and not others:** if the approved ones carry a look nudge the others lack, apply that same change to the whole set and to the stored grade with one command, instead of nudging photos one by one:
   ```
   PY -m engine.workflow nudge --run RUN --photo all --grade HueAdjustmentOrange=-20 HueAdjustmentYellow=-20

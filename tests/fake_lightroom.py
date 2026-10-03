@@ -53,7 +53,8 @@ class FakeLightroom:
         return [item["path"] for item in items]
 
     def get_settings(self, items):
-        return [{"id": i["id"], "settings": dict(self.photos[i["id"]]["settings"])}
+        return [{"id": i["id"], "fileName": self.photos[i["id"]].get("fileName"),
+                 "settings": dict(self.photos[i["id"]]["settings"])}
                 for i in items if i["id"] in self.photos]
 
     def mask_adjust(self, photo_id, kind, values):

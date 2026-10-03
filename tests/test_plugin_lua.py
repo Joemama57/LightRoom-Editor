@@ -383,3 +383,13 @@ def test_mask_adjust_reports_no_detection(lua_env):
                 "m.createNewMask = function(k, s) return orig(k, 'nothing') end")
     msg = run_bridge_with_client(lua_env, client_fn, seconds=10.0)
     assert "didn't create a objects mask" in msg
+
+
+def test_get_settings_names_each_photo_and_survives_a_failing_one(lua_env):
+    lua, py, catalog, by_id = lua_env
+    lua.execute("""
+      local p = ...
+      function p:getDevelopSettings() error("photo of a closed catalog") end
+    """, by_id[11])
+    settings = run_bridge_with_client(lua_env, lambda c: c.get_settings([{"id": "11"}, {"id": "12"}]))
+    assert [(s["id"], s["fileName"]) for s in settings] == [("12", "B.jpg")]

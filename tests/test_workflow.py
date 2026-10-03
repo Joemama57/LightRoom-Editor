@@ -500,3 +500,77 @@ def test_a_raw_file_from_another_shoot_keeps_the_wide_limits(tmp_path):
     assert "same_shoot" not in p["flags"] and "different_file_type" in p["flags"]
     moved = max(abs(p["final"][k] - p["start"][k]) for k in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"))
     assert moved > 15 or abs(p["final"]["Tint"] - p["start"]["Tint"]) > 10  # what the held-close photo is spared
+
+
+def _shoot_off_wb(target_time):
+    """A reference and a frame from its light whose camera white balance read 2000 K too warm."""
+    scene = make_scene(seed=0)
+    ref = photo(capture(scene, 5500), "DSC0001.ARW", settings=dict(REF_SETTINGS))
+    off = photo(capture(make_scene(seed=1)[4:, 2:], 5500), "DSC0002.ARW",
+                settings={"WhiteBalance": "As Shot", "Temperature": 7500, "Tint": 0})
+    ref["captureTime"], off["captureTime"] = 0.0, target_time
+    return FakeLightroom({"ref": ref, "off": off}, active="ref")
+
+
+def _mired_move(p):
+    return 1e6 / p["final"]["Temperature"] - 1e6 / p["start"]["Temperature"]
+
+
+def test_a_raw_from_the_same_shoot_keeps_its_white_balance_close(tmp_path):
+    report = run_match(_shoot_off_wb(600.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert p["wb_from_camera"] and "same_shoot" in p["flags"]
+    assert abs(_mired_move(p)) <= 20 + 0.5
+    assert abs(p["final"]["Tint"] - p["start"]["Tint"]) <= 10 + 1e-6
+
+
+def test_a_raw_from_another_shoot_can_move_its_white_balance_further(tmp_path):
+    report = run_match(_shoot_off_wb(5 * 3600.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" not in p["flags"]
+    assert abs(_mired_move(p)) > 20
+
+
+def _shoot_state(moves):
+    """Same-shoot raws that started at 6000 K / Tint 20 and moved (mired, tint)."""
+    state = {}
+    for n, (mired, tint) in enumerate(moves):
+        start = {"Temperature": 6000.0, "Tint": 20.0, "Exposure2012": 0.0, "Shadows2012": 0.0,
+                 "Highlights2012": 0.0, "Whites2012": 0.0, "Blacks2012": 0.0}
+        matched = dict(start, Temperature=round(1e6 / (1e6 / 6000 + mired)), Tint=20.0 + tint)
+        state[str(n)] = {"photo": {"fileName": f"DSC{n}.ARW"}, "start": start, "matched": matched,
+                         "shoot_wb": True, "extra_flags": []}
+    return state
+
+
+def test_a_white_balance_outlier_in_a_shoot_gets_the_shoots_move():
+    from engine.workflow import _pull_shoot_outliers
+    state = _shoot_state([(8, -8), (14, 0), (19, -2), (6, -7), (-6, -2), (-7, -4), (-44, 12)])
+    before = {k: dict(s["matched"]) for k, s in state.items()}
+    _pull_shoot_outliers(state, quiet)
+    outlier = state["6"]
+    assert outlier["extra_flags"] == ["wb_from_shoot"]
+    assert 1e6 / outlier["matched"]["Temperature"] - 1e6 / 6000 == pytest.approx(6, abs=0.5)  # the median move
+    assert outlier["matched"]["Tint"] == pytest.approx(20 - 2)
+    for k in "012345":
+        assert state[k]["matched"] == before[k] and not state[k]["extra_flags"]
+
+
+def test_too_few_shoot_raws_have_no_median_to_go_by():
+    from engine.workflow import _pull_shoot_outliers
+    state = _shoot_state([(8, 0), (-44, 12)])
+    _pull_shoot_outliers(state, quiet)
+    assert not any(s["extra_flags"] for s in state.values())
+
+
+def test_learning_ignores_photos_of_another_catalog(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    for p in lightroom.photos.values():  # the same ids are other photos in the open catalog
+        p["fileName"] = "OTHER_" + p["fileName"]
+        p["settings"]["Tint"] = p["settings"].get("Tint", 0) + 6
+    messages = []
+    assert learn_from_run(lightroom, tmp_path / "run", learner, messages.append) == 0
+    assert learner.data["preference"] == {}
+    assert "learned" not in json.loads((tmp_path / "run" / "report.json").read_text())  # learnable later from its own catalog
+    assert any("aren't in the open catalog" in m for m in messages)

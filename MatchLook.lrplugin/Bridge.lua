@@ -217,12 +217,22 @@ function commands.render(params)
 end
 
 -- Photos that no longer exist (deleted, or another catalog is open) are skipped.
+-- Looked up in the open catalog only, not the selection cache: a cached photo can
+-- belong to a catalog that was closed since. Ids are local to a catalog, so the
+-- file name comes back too, for the caller to check it is the same photo.
 function commands.get_settings(params)
+	local catalog = LrApplication.activeCatalog()
 	local out = {}
 	for _, item in ipairs(params.items or {}) do
-		local ok, photo = LrTasks.pcall(findPhoto, item.id)
-		if ok then
-			out[#out + 1] = { id = item.id, settings = photo:getDevelopSettings() }
+		local ok, entry = LrTasks.pcall(function()
+			local photo = catalog:getPhotoByLocalId(tonumber(item.id))
+			if photo then
+				return { id = item.id, fileName = photo:getFormattedMetadata("fileName"),
+					settings = photo:getDevelopSettings() }
+			end
+		end)
+		if ok and entry then
+			out[#out + 1] = entry
 		end
 	end
 	return out
