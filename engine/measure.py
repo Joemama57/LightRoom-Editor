@@ -20,6 +20,12 @@ NEUTRAL_RADII = (30.0, 20.0, 14.0)  # successive a*b* radii around the cast esti
 # neutral axis): any remaining cast is small, and saturated content stays out.
 HINT_RADII = (15.0, 12.0, 10.0)
 MIN_NEUTRAL_FRACTION = 0.02
+# How bright the frame's whites and greys are (clothes, garlands, walls): the median
+# L* of low-colour pixels. A frame full of gold walls reads bright on its overall
+# median while its white clothes look dull; this is what the eye judges by. None
+# when too few pixels are low in colour.
+LIGHT_CHROMA = 20.0
+LIGHT_MIN_FRACTION = 0.1
 
 
 @dataclass
@@ -34,6 +40,7 @@ class Metrics:
     skin_fraction: float = 0.0
     skin_L: float = None
     skin_source: str = None  # "faces" when skin was measured inside detected faces (--face-skin)
+    light_L: float = None  # median L* of low-colour pixels (LIGHT_CHROMA)
 
     def to_dict(self):
         return asdict(self)
@@ -79,6 +86,8 @@ def measure(img, neutral_hint=None, face_boxes=None):
 
     # Tone percentiles use every pixel: clipping is part of the tonal look.
     L = {f"p{p}": float(v) for p, v in zip(PERCENTILES, np.percentile(lab[:, 0], PERCENTILES))}
+    plain = np.hypot(lab[:, 1], lab[:, 2]) < LIGHT_CHROMA
+    light_L = float(np.median(lab[plain, 0])) if plain.mean() >= LIGHT_MIN_FRACTION else None
 
     usable = lab[~clipped]
     if len(usable) == 0:
@@ -137,6 +146,7 @@ def measure(img, neutral_hint=None, face_boxes=None):
         skin_fraction=skin_fraction,
         skin_L=skin_L,
         skin_source=skin_source,
+        light_L=light_L,
     )
 
 

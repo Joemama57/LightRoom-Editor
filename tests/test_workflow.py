@@ -460,7 +460,8 @@ def _shoot(target_time, camera="Sony A7 IV"):
 @pytest.mark.parametrize("seconds", [600.0, 5 * 3600.0])
 def test_a_close_up_from_the_same_shoot_keeps_the_references_exposure(tmp_path, seconds):
     # A wedding stage is lit the same for hours: a frame 5 h later is still the same shoot.
-    report = run_match(_shoot(seconds), tmp_path, log=quiet)
+    # (Without evening the shoot's brightness, which is on by default.)
+    report = run_match(_shoot(seconds), tmp_path, even_shoot_tone=False, log=quiet)
     (p,) = report["photos"]
     assert "same_shoot" in p["flags"]
     assert abs(p["final"]["Exposure2012"] - REF_SETTINGS["Exposure2012"]) <= 0.3 + 1e-6
@@ -984,20 +985,19 @@ def _ceremony(frames, backdrop=None, tone=None):
 
 def test_frames_of_one_shoot_are_evened_toward_the_references_brightness(tmp_path):
     frames = {"lights": 0.8, "crowd": -0.8, "candles": -3.0}
-    held = {p["id"]: p for p in run_match(_ceremony(frames), tmp_path / "off", log=quiet)["photos"]}
+    held = {p["id"]: p for p in run_match(_ceremony(frames), tmp_path / "off", even_shoot_tone=False,
+                                          log=quiet)["photos"]}
     report = run_match(_ceremony(frames), tmp_path / "on", even_shoot_tone=True, log=quiet)
-    ref_p50 = report["reference"]["metrics"]["L"]["p50"]
     for p in report["photos"]:
-        first = p["trace"][0]["p50"]
         if p["id"] == "candles":  # another kind of scene: left as it was
             assert "tone_from_shoot" not in p["flags"] and p["final"] == held["candles"]["final"]
             continue
         st = p["shoot_tone"]
         assert "tone_from_shoot" in p["flags"] and "tone_from_shoot" not in held[p["id"]]["flags"]
-        assert abs(st["after"]["p50"] - ref_p50) < abs(st["before"]["p50"] - ref_p50)
-        # Part of the gap is kept as content: a brighter frame stays a little brighter.
-        assert abs(st["after"]["p50"] - (ref_p50 + workflow.SHOOT_TONE_KEEP * (first - ref_p50))) < 3.0
-        assert abs(p["final"]["Exposure2012"]) <= 0.6
+        assert abs(st["after"]["level"] - st["reference"]["level"]) < abs(st["before"]["level"] - st["reference"]["level"])
+        # Judged on its whites and greys, matched to the reference's.
+        assert st["judged_on"] == "whites" and abs(st["after"]["level"] - st["reference"]["level"]) < 3.0
+        assert -workflow.SHOOT_TONE_DARKEN_EV <= p["final"]["Exposure2012"] <= workflow.SHOOT_TONE_EV
     assert next(p for p in report["photos"] if p["id"] == "lights")["final"]["Exposure2012"] < -0.3
     assert next(p for p in report["photos"] if p["id"] == "crowd")["final"]["Exposure2012"] > 0.3
 
@@ -1005,7 +1005,7 @@ def test_frames_of_one_shoot_are_evened_toward_the_references_brightness(tmp_pat
 def test_a_hazy_bright_frame_gets_less_shadow_lift(tmp_path):
     tone = {"Exposure2012": 0.65, "Shadows2012": 66, "Highlights2012": -61, "Blacks2012": -60}
     lr = lambda: _ceremony({"couple": 0.6}, backdrop=(0.7, 0.2), tone=tone)
-    (held,) = run_match(lr(), tmp_path / "off", log=quiet)["photos"]
+    (held,) = run_match(lr(), tmp_path / "off", even_shoot_tone=False, log=quiet)["photos"]
     (p,) = run_match(lr(), tmp_path / "on", even_shoot_tone=True, log=quiet)["photos"]
     assert held["final"]["Shadows2012"] == 66 and held.get("shoot_tone") is None
     assert p["final"]["Shadows2012"] == 33 and p["final"]["Exposure2012"] < held["final"]["Exposure2012"]
@@ -1015,6 +1015,72 @@ def test_a_hazy_bright_frame_gets_less_shadow_lift(tmp_path):
 def test_frames_whose_faces_already_match_keep_their_brightness(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "_face_gap", lambda ref, m, s: 0.0)  # faces as bright as the reference's
     frames = {"lights": 0.8, "crowd": -0.8}
-    held = {p["id"]: p["final"] for p in run_match(_ceremony(frames), tmp_path / "off", log=quiet)["photos"]}
+    held = {p["id"]: p["final"] for p in run_match(_ceremony(frames), tmp_path / "off", even_shoot_tone=False,
+                                                   log=quiet)["photos"]}
     for p in run_match(_ceremony(frames), tmp_path / "on", even_shoot_tone=True, log=quiet)["photos"]:
         assert p["final"] == held[p["id"]] and p.get("shoot_tone") is None
+
+
+def test_a_gold_wall_frame_is_judged_by_its_whites_not_its_overall_brightness(tmp_path):
+    """Gold walls make the frame's median bright while its white clothes are dull
+    (run 20261003-234416): it is brightened, not darkened."""
+    ref = photo(capture(make_scene(seed=0), 3000), "DSC1416.ARW", settings={**REF_SETTINGS, "Temperature": 3000})
+    ref["captureTime"] = 0.0
+    scene = make_scene(seed=1)[4:, 2:].copy()
+    half = scene.shape[0] // 2
+    scene[:half] = [0.75, 0.45, 0.06]  # gold
+    scene[half:] *= 0.5  # whites and greys that came out dull
+    target = photo(capture(scene, 3000), "DSC1475.ARW", settings={"WhiteBalance": "As Shot", "Temperature": 3000, "Tint": 0})
+    target["captureTime"] = 60.0
+    lr = FakeLightroom({"ref": ref, "t": target}, active="ref")
+    (p,) = run_match(lr, tmp_path, even_shoot_tone=True, log=quiet)["photos"]
+    assert p["trace"][0]["p50"] > p["shoot_tone"]["reference"]["p50"] + 10  # bright overall...
+    assert p["shoot_tone"]["judged_on"] == "whites"
+    assert p["final"]["Exposure2012"] > 0.2  # ...but brightened, toward the reference's whites
+    assert abs(p["shoot_tone"]["after"]["level"] - p["shoot_tone"]["reference"]["level"]) < 2.0
+
+
+def test_a_later_photo_with_the_same_camera_reading_gets_the_references_white_balance(tmp_path):
+    """A camera set to a fixed white balance reads the same all ceremony: a photo 15
+    minutes later is in the same light, so it gets the user's choice too."""
+    report = run_match(_stage(3000, {"mate": (30.0, 5500), "later": (900.0, 5500), "other": (900.0, 5000)}),
+                       tmp_path, log=quiet)
+    photos = {p["id"]: p for p in report["photos"]}
+    assert "wb_offset_from_reference" in photos["later"]["flags"]
+    assert photos["later"]["start"]["Temperature"] == photos["mate"]["start"]["Temperature"]
+    assert "wb_offset_from_reference" not in photos["other"]["flags"]  # its camera read other light
+
+
+def test_the_shoot_hold_also_keeps_photos_set_from_the_references_offset(tmp_path):
+    report = run_match(_stage(3000, {"mate": (30.0, 5500), "later": (900.0, 5500)}), tmp_path,
+                       hold_shoot_wb=True, log=quiet)
+    for p in report["photos"]:
+        assert "wb_from_reference" in p["flags"] and "wb_offset_from_reference" in p["flags"]
+        assert (p["final"]["Temperature"], p["final"]["Tint"]) == (p["start"]["Temperature"], p["start"]["Tint"])
+
+
+def test_a_much_brighter_frame_can_be_darkened_by_up_to_a_stop(tmp_path):
+    """White walls in a landscape frame against a portrait reference with a big sky
+    (run 20261003-235638): whites 17-20 L* brighter, brought back by about a stop."""
+    (p,) = run_match(_ceremony({"walls": 1.2}), tmp_path, even_shoot_tone=True, log=quiet)["photos"]
+    st = p["shoot_tone"]
+    assert -1.0 <= p["final"]["Exposure2012"] < -0.6
+    assert abs(st["after"]["level"] - st["reference"]["level"]) < abs(st["before"]["level"] - st["reference"]["level"]) / 2
+
+
+def test_the_report_lists_the_references_local_adjustments_it_did_not_copy(tmp_path):
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings={**REF_SETTINGS, "MaskGroupBasedCorrections": [
+        {"CorrectionName": "Sky", "What": "Correction", "LocalExposure2012": -0.6, "LocalSaturation": 0.2,
+         "LocalContrast": 0.0, "CorrectionMasks": [{"What": "Mask/Image", "MaskSubType": 2}]}]})
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    report = run_match(lr, tmp_path, log=quiet)
+    (c,) = report["reference"]["local_corrections"]
+    assert c["name"] == "Sky" and c["values"] == {"LocalExposure2012": -0.6, "LocalSaturation": 0.2}
+    assert c["masks"] == [{"What": "Mask/Image", "MaskSubType": 2}]
+    assert any("local adjustment" in w for w in report["warnings"])
+    assert "MaskGroupBasedCorrections" not in lr.photos["t"]["settings"]  # still not copied
+
+
+def test_evening_the_shoots_brightness_is_on_by_default(tmp_path):
+    (p,) = run_match(_ceremony({"walls": 1.2}), tmp_path, log=quiet)["photos"]
+    assert "tone_from_shoot" in p["flags"]

@@ -451,7 +451,10 @@ def main(argv=None):
     b.add_argument("runs", nargs="+")
     for cmd in (b, sub.choices["rerun"]):
         cmd.add_argument("--hold-shoot-wb", action="store_true", help="try the shoot white-balance hold")
-        cmd.add_argument("--even-shoot-tone", action="store_true", help="try evening the shoot's brightness")
+        cmd.add_argument("--even-shoot-tone", dest="even_shoot_tone", action="store_true", default=True,
+                         help="even the shoot's brightness (the default)")
+        cmd.add_argument("--no-even-shoot-tone", dest="even_shoot_tone", action="store_false",
+                         help="replay without evening the shoot's brightness")
         _subject_args(cmd)
     args = parser.parse_args(argv)
     try:
