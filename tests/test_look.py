@@ -148,6 +148,10 @@ def test_reference_edited_in_lightroom_is_not_baked():
     assert look.is_baked({"ProcessVersion": "11.0", "CameraProfile": "Adobe Standard"})
     assert not look.is_baked({"SaturationAdjustmentBlue": 10})
     assert not look.is_baked({"ToneCurvePV2012": [0, 10, 128, 140, 255, 255]})
+    for edited in ({"Clarity2012": 20}, {"Dehaze": 10}, {"ColorGradeMidtoneSat": 15}, {"BlueSaturation": 30},
+                   {"PointColors": [{"SrcHue": 0.6}]}, {"ToneCurvePV2012Blue": [0, 20, 255, 255]}):
+        assert not look.is_baked(edited), edited
+    assert look.is_baked({"ToneCurvePV2012Red": [0, 0, 255, 255], "PointColors": []})
 
 
 def test_contact_sheet_notes_stay_short_and_skip_skin_unless_asked():

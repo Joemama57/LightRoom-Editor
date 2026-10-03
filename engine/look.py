@@ -396,15 +396,24 @@ def has_split_toning(creative):
                 or creative.get("ColorGradeShadowSat") or creative.get("ColorGradeHighlightSat"))
 
 
+# Other creative sliders that mean the reference was edited in Lightroom: with
+# any of them set, its settings are copied as they are instead of guessed.
+EDIT_KEYS = (
+    ["Clarity2012", "Dehaze", "Texture"]
+    + [f"ColorGrade{zone}{kind}" for zone in ("Midtone", "Shadow", "Highlight", "Global") for kind in ("Sat", "Lum")]
+    + [f"{c}{kind}" for c in ("Red", "Green", "Blue") for kind in ("Hue", "Saturation")] + ["ShadowTint"]
+)
+
+
 def is_baked(creative):
     """True when the reference carries no creative colour or tone edits of its
     own (typically an exported JPEG): its look is in the pixels only."""
-    keys = TONE_KEYS + SAT_KEYS + BAND_KEYS + SPLIT_KEYS + [
-        "ColorGradeMidtoneSat", "ColorGradeShadowSat", "ColorGradeHighlightSat", "ColorGradeGlobalSat"]
-    if any(float(creative.get(k) or 0) != 0 for k in keys):
+    if any(float(creative.get(k) or 0) != 0 for k in TONE_KEYS + SAT_KEYS + BAND_KEYS + SPLIT_KEYS + EDIT_KEYS):
         return False
-    curve = creative.get("ToneCurvePV2012")
-    return not curve or list(curve) in ([0, 0, 255, 255], [0.0, 0.0, 255.0, 255.0])
+    if creative.get("PointColors"):
+        return False
+    curves = ("ToneCurvePV2012", "ToneCurvePV2012Red", "ToneCurvePV2012Green", "ToneCurvePV2012Blue")
+    return all(not creative.get(c) or [float(v) for v in creative[c]] == [0.0, 0.0, 255.0, 255.0] for c in curves)
 
 
 def to_settings(offsets, creative, split_limit=SPLIT_LIMIT):
