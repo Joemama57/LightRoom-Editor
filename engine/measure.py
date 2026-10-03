@@ -27,6 +27,11 @@ MIN_NEUTRAL_FRACTION = 0.02
 # when too few pixels are low in colour.
 LIGHT_CHROMA = 20.0
 LIGHT_MIN_FRACTION = 0.1
+# Low-colour pixels darker than this are shadows, black doorways and dark suits, not
+# whites: on the hotel corridor run (20261004-013517) the only low-colour pixels in
+# the tight frames were a black doorway, so "whites" read 2-6 L* against the
+# reference's 57 and the frames were judged another kind of scene.
+LIGHT_MIN_L = 30.0
 # Opt-in neutral readings (see neutral_options), both off by default until a bench
 # on real runs shows they help:
 # - no_warm: cream and gold fabric, sand and dry grass sit near the cast estimate
@@ -67,6 +72,7 @@ class Metrics:
     skin_L: float = None
     skin_source: str = None  # "faces" when skin was measured inside detected faces (--face-skin)
     light_L: float = None  # median L* of low-colour pixels (LIGHT_CHROMA)
+    light_fraction: float = None  # share of the frame those pixels make up
 
     def to_dict(self):
         return asdict(self)
@@ -108,12 +114,19 @@ def measure(img, neutral_hint=None, face_boxes=None):
     img = img.reshape(-1, 3)
 
     clipped = (img < CLIP_LOW).any(axis=1) | (img > CLIP_HIGH).any(axis=1)
+    # Clipping that loses detail: a channel blown out, or black in every channel. A
+    # saturated colour with one channel at zero (an orange saree has almost no blue)
+    # still has its detail, so it doesn't count (corridor run 20261004-013517: 5 of
+    # 10 photos flagged mostly_clipped on the saree alone). The neutral search below
+    # still leaves those pixels out: they aren't neutral.
+    lost = (img > CLIP_HIGH).any(axis=1) | (img < CLIP_LOW).all(axis=1)
     lab = srgb_to_lab(img)
 
     # Tone percentiles use every pixel: clipping is part of the tonal look.
     L = {f"p{p}": float(v) for p, v in zip(PERCENTILES, np.percentile(lab[:, 0], PERCENTILES))}
-    plain = np.hypot(lab[:, 1], lab[:, 2]) < LIGHT_CHROMA
-    light_L = float(np.median(lab[plain, 0])) if plain.mean() >= LIGHT_MIN_FRACTION else None
+    plain = (np.hypot(lab[:, 1], lab[:, 2]) < LIGHT_CHROMA) & (lab[:, 0] >= LIGHT_MIN_L)
+    light_fraction = float(plain.mean())
+    light_L = float(np.median(lab[plain, 0])) if light_fraction >= LIGHT_MIN_FRACTION else None
 
     usable = lab[~clipped]
     if len(usable) == 0:
@@ -171,7 +184,7 @@ def measure(img, neutral_hint=None, face_boxes=None):
         a=float(np.mean(pool[:, 1])),
         b=float(np.mean(pool[:, 2])),
         L=L,
-        clipped_fraction=float(clipped.mean()),
+        clipped_fraction=float(lost.mean()),
         neutral_fraction=neutral_fraction,
         skin_a=skin_a,
         skin_b=skin_b,
@@ -179,6 +192,7 @@ def measure(img, neutral_hint=None, face_boxes=None):
         skin_L=skin_L,
         skin_source=skin_source,
         light_L=light_L,
+        light_fraction=light_fraction,
     )
 
 

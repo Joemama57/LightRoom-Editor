@@ -81,3 +81,23 @@ def test_bright_whites_can_count_as_neutrals():
     with neutral_options(bright=True):
         bright = measure(_grey_and_cream(), neutral_hint=(0.0, 0.0))
     assert bright.neutral_fraction > plain.neutral_fraction
+
+
+def test_dark_low_colour_pixels_are_not_whites():
+    """A black doorway is low in colour but isn't the frame's whites (corridor run 20261004-013517)."""
+    img = np.full((64, 64, 3), 0.02)  # black doorway
+    img[:, :4] = 0.8  # a sliver of white wall, under LIGHT_MIN_FRACTION
+    m = measure(img)
+    assert m.light_L is None and m.light_fraction < 0.1
+    img[:, :32] = 0.8
+    m = measure(img)
+    assert m.light_L > 80 and abs(m.light_fraction - 0.5) < 0.01
+
+
+def test_a_saturated_colour_is_not_clipping():
+    """An orange saree has almost no blue: one channel at zero keeps its detail."""
+    img = np.full((64, 64, 3), 0.5)
+    img[:32] = [0.9, 0.35, 0.0]
+    assert measure(img).clipped_fraction == 0.0
+    img[:32] = 0.0  # black in every channel is
+    assert measure(img).clipped_fraction == 0.5

@@ -132,6 +132,23 @@ SHOOT_TONE_DEADBAND = 3.0
 # called too dark (58 vs 71) and too bright (74-79).
 SHOOT_TONE_LIGHT_KEEP = 0.0
 SHOOT_TONE_LIGHT_DEADBAND = 2.0
+# Whites are only a fair measure when both frames show a similar amount of them:
+# the target's low-colour share (Metrics.light_fraction) must be at least this
+# share of the reference's, else mid-tones are used. On the hotel corridor run
+# (20261004-013517) the reference was 54% cream walls and floor, while the frames
+# of the bride leaning on a lit white wall had 1-22%: the whites they were judged
+# by were that wall, brighter than the reference's walls, so four frames were
+# darkened while their faces were already 6-7 L* darker than the reference's.
+SHOOT_TONE_LIGHT_SHARE = 0.5
+# A brightness change that makes the colour worse by more than this (colour-only
+# error, CIEDE2000) is put back: on the corridor run darkening 00952 pulled its
+# cool key-lit wall into the neutral reading and its error went 4.45 -> 9.14.
+SHOOT_TONE_COLOUR_SLACK = 1.0
+# Opt-in (--face-tone, with --face-skin): a frame skipped as another kind of scene
+# whose detected faces are more than SKIN_ANCHOR_DEADBAND darker than the
+# reference's is brightened toward the reference's faces instead, up to
+# SHOOT_TONE_EV. The corridor close-ups (black doorway beside the bride) read
+# 25-31 L* darker on mid-tones but their faces only 4-11 L* darker.
 # A frame brighter than the reference may be darkened further than a dark one is
 # brightened: darkening can't blow anything out. On the temple run (20261003-235638)
 # landscape frames of white walls came out 17-20 L* brighter in their whites than
@@ -448,16 +465,18 @@ def run_match(bridge, out_dir, *, face_skin=False, skin_error=False, skin_wb=Fal
     skin_error: judge renders with the skin-weighted CIEDE2000 error.
     skin_wb: solve white balance toward the reference's skin, neutrals as a
         guard. Needs skin from faces, so it turns on face_skin too.
+    face_tone (in kwargs, see _run_match) needs faces as well: it turns on face_skin.
     """
-    face_skin = face_skin or skin_wb
+    face_skin = face_skin or skin_wb or kwargs.get("face_tone", False)
     if face_skin or skin_error or skin_wb:
         kwargs["skin"] = True
     with subject.use(face_skin=face_skin, skin_error=skin_error, skin_wb=skin_wb) as chosen, \
             measure_stage.neutral_options(no_warm=neutral_no_warm, bright=bright_neutrals):
         report = _run_match(bridge, out_dir, **kwargs)
         note = faces.fallback_warning()
-    if neutral_no_warm or bright_neutrals:
-        report["options"].update(neutral_no_warm=neutral_no_warm, bright_neutrals=bright_neutrals)
+    extra = {k: True for k in ("face_tone", "copy_masks") if kwargs.get(k)}
+    if neutral_no_warm or bright_neutrals or extra:
+        report["options"].update(neutral_no_warm=neutral_no_warm, bright_neutrals=bright_neutrals, **extra)
         (Path(out_dir) / "report.json").write_text(json.dumps(report, indent=2))
     if any(chosen.report().values()) or note:
         report["options"]["subject"] = chosen.report()
@@ -492,6 +511,8 @@ def _run_match(
     hold_shoot_wb=False,
     skin_hue=False,
     even_shoot_tone=True,
+    face_tone=False,
+    copy_masks=False,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
@@ -519,6 +540,12 @@ def _run_match(
     even_shoot_tone: photos from the reference's shoot are moved toward its
         mid-tone brightness, and hazy bright ones get less Shadows lift
         (SHOOT_TONE_KEEP). On by default (the user's choice, 2026-10-03).
+    face_tone: with face skin, a same-shoot frame skipped by even_shoot_tone as
+        another kind of scene is brightened toward the reference's faces when
+        its faces are darker (SHOOT_TONE_COLOUR_SLACK notes). Off by default.
+    copy_masks: give every photo the reference's background mask (an inverted
+        Select Subject mask) with its sliders, through Lightroom's AI masks
+        (COPY_MASK_KEYS). Off by default.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -784,7 +811,7 @@ def _run_match(
             state[item["id"]]["final_metrics"] = measure_file(item["path"], hint)
 
     if even_shoot_tone:
-        _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
+        _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log, face_tone=face_tone)
 
     if skin:
         _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
@@ -803,6 +830,9 @@ def _run_match(
                                              warnings, log, hint)
         for s in state.values():
             s["before_look"] = _look_fingerprint(s["photo"].get("settings") or {}, creative)
+
+    if copy_masks:
+        _copy_reference_masks(bridge, state, ref_local, out_dir, size, hint, warnings, log)
 
     for s in state.values():
         o = s["options"]
@@ -905,6 +935,7 @@ def _run_match(
             "skin_note": _skin_note(s["final_metrics"]),
             "final_error_with_tone": (round(match_error(s["target"], s["final_metrics"], skin=s["options"].skin), 2)
                                       if s["same_shoot"] and not s["options"].color_only else None),
+            **({"masks": s["masks"], "copied_masks": s["copied_masks"]} if s.get("copied_masks") else {}),
             "start_preview": s["history"][0]["preview"],
             "preview": s["preview"],
         })
@@ -1023,7 +1054,21 @@ def _face_gap(ref_metrics, m, s):
     return m.skin_L - ref_metrics.skin_L
 
 
-def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print):
+def _whites_comparable(ref_metrics, m):
+    """Both frames show enough low-colour pixels, and a similar share of them
+    (SHOOT_TONE_LIGHT_SHARE). A share missing (an older report) counts as similar."""
+    if ref_metrics.light_L is None or m.light_L is None:
+        return False
+    if ref_metrics.light_fraction is None or m.light_fraction is None:
+        return True
+    return m.light_fraction >= SHOOT_TONE_LIGHT_SHARE * ref_metrics.light_fraction
+
+
+def _colour_error(s, m):
+    return match_error(s["target"], m, skin=s["options"].skin, color_only=True)
+
+
+def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print, face_tone=False):
     """Even out the brightness of photos from the reference's shoot (see
     SHOOT_TONE_KEEP): exposure toward the reference's mid-tones, keeping part of
     the gap as content, and less Shadows lift on a bright frame that went hazy.
@@ -1035,24 +1080,35 @@ def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, 
             continue
         first = Metrics.from_dict(s["history"][0]["metrics"])
         m = s["final_metrics"]
-        light = all(x.light_L is not None for x in (ref_metrics, first, m))
+        light = _whites_comparable(ref_metrics, first) and m.light_L is not None
         level = (lambda x: x.light_L) if light else (lambda x: x.L["p50"])
         keep, deadband = (SHOOT_TONE_LIGHT_KEEP, SHOOT_TONE_LIGHT_DEADBAND) if light else (SHOOT_TONE_KEEP,
                                                                                           SHOOT_TONE_DEADBAND)
+        judged_on = "whites" if light else "mid-tones"
         gap = level(first) - level(ref_metrics)
-        if gap > SHOOT_TONE_DARKEN_GAP or gap < -SHOOT_TONE_MAX_GAP:
-            continue
-        target = level(ref_metrics) + keep * gap
         face_gap = _face_gap(ref_metrics, m, s)
-        if face_gap is not None and (target > level(m) and face_gap > -SKIN_ANCHOR_DEADBAND
-                                     or target < level(m) and face_gap < SKIN_ANCHOR_DEADBAND):
+        # Far darker on its mid-tones too: another kind of scene, whatever its whites say
+        # (beach run 20261004-004044, DSC00143: mid-tones 23 L* under, left alone as before).
+        dark_scene = first.L["p50"] - ref_metrics.L["p50"] < -SHOOT_TONE_MAX_GAP
+        if gap > SHOOT_TONE_DARKEN_GAP or gap < -SHOOT_TONE_MAX_GAP or dark_scene and gap < 0:
+            if not (face_tone and gap < 0 and face_gap is not None and face_gap < -SKIN_ANCHOR_DEADBAND
+                    and m.skin_source == "faces"):
+                continue
+            # Another kind of scene by its mid-tones, but its faces say it is too dark.
+            level, keep, deadband, judged_on = (lambda x: x.skin_L), 0.0, SKIN_ANCHOR_DEADBAND, "faces"
+            gap = face_gap
+        target = level(ref_metrics) + keep * gap
+        if judged_on != "faces" and face_gap is not None and (
+                target > level(m) and face_gap > -SKIN_ANCHOR_DEADBAND
+                or target < level(m) and face_gap < SKIN_ANCHOR_DEADBAND):
             target = level(m)  # the faces already say this frame is bright (or dark) enough
         hazy = (gap > 0 and _spread(m) < SHOOT_TONE_FLAT * ref_spread
                 and s["final"]["Shadows2012"] > 0)
         if abs(level(m) - target) < deadband and not hazy:
             continue
         live[pid] = {"target": target, "hazy": hazy, "slope": None, "level": level, "deadband": deadband,
-                     "judged_on": "whites" if light else "mid-tones",
+                     "colour": _colour_error(s, m),
+                     "judged_on": judged_on,
                      "before": {"Exposure2012": s["final"]["Exposure2012"], "Shadows2012": s["final"]["Shadows2012"],
                                 "p50": round(m.L["p50"], 1), "spread": round(_spread(m), 1),
                                 "level": round(level(m), 1)}}
@@ -1098,7 +1154,12 @@ def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, 
             faces_before, faces_after = _face_gap(ref_metrics, old, s), _face_gap(ref_metrics, m, s)
             faces_off = (faces_before is not None and faces_after is not None
                          and abs(faces_after) > max(abs(faces_before), SKIN_ANCHOR_DEADBAND))
-            if (closer or settled and deeper) and not flatter and not faces_off:
+            colour_before, colour_after = t["colour"], _colour_error(s, m)  # against before any tone change
+            colour_off = colour_after > colour_before + SHOOT_TONE_COLOUR_SLACK
+            if colour_off:
+                log(f"{s['photo']['fileName']}: brightness change put back, it made the colour worse "
+                    f"({colour_before:.1f} -> {colour_after:.1f})")
+            if (closer or settled and deeper) and not flatter and not faces_off and not colour_off:
                 d_ev = moves[pid]["Exposure2012"] - s["final"]["Exposure2012"]
                 if abs(d_ev) >= 0.05 and moves[pid]["Shadows2012"] == s["final"]["Shadows2012"]:
                     t["slope"] = (level(m) - level(old)) / d_ev
@@ -1121,7 +1182,7 @@ def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, 
                 undo.append({"id": pid, "settings": _corrective_settings(s["final"])})
                 d_ev = moves[pid]["Exposure2012"] - s["final"]["Exposure2012"]
                 overshot = (level(m) - t["target"]) * (level(old) - t["target"]) < 0
-                if (overshot and not flatter and not faces_off and abs(d_ev) >= 0.05
+                if (overshot and not flatter and not faces_off and not colour_off and abs(d_ev) >= 0.05
                         and moves[pid]["Shadows2012"] == s["final"]["Shadows2012"]
                         and (level(m) - level(old)) / d_ev > 1.0):
                     # Went past the target: the render says how far a stop moves it, so try that next.
@@ -1634,6 +1695,77 @@ def local_corrections(settings):
                            if k.startswith("Local") and isinstance(v, (int, float)) and not isinstance(v, bool) and v},
             })
     return out
+
+
+# Opt-in (--copy-masks): the reference's background mask is copied onto every photo.
+# Lightroom's "background" is an inverted Select Subject mask (What Mask/Image,
+# MaskSubType 1, MaskInverted), which the bridge can create (MASK_KINDS). Only the
+# sliders below are copied; local sliders are stored as a fraction of +-100, except
+# LocalExposure2012, in stops (MatchLook.lrplugin/Bridge.lua). On the hotel corridor
+# run (20261004-013517) the user's review nudged every photo's background
+# Temperature -14 by hand, which is the reference's own -14.5. A copy that makes the
+# colour worse by more than SHOOT_TONE_COLOUR_SLACK (a key-lit white wall turning
+# blue, corridor 00952/56/57) is tried again without its Temperature, then removed.
+COPY_MASK_KEYS = ("LocalTemperature", "LocalTint", "LocalExposure2012", "LocalShadows2012", "LocalHighlights2012",
+                  "LocalWhites2012", "LocalBlacks2012", "LocalSaturation")
+
+
+def reference_background_mask(ref_local):
+    """The reference's background mask sliders in UI units, or None when it has none."""
+    for c in ref_local or []:
+        masks = c.get("masks") or []
+        if c.get("kind") != "MaskGroupBasedCorrections" or not masks:
+            continue
+        if all(m.get("What") == "Mask/Image" and m.get("MaskSubType") == 1 and m.get("MaskInverted") for m in masks):
+            values = {k: round(float(v) * (1.0 if k == "LocalExposure2012" else 100.0), 2)
+                      for k, v in (c.get("values") or {}).items() if k in COPY_MASK_KEYS}
+            values = {k: v for k, v in values.items() if v}
+            if values:
+                return values
+    return None
+
+
+def _copy_reference_masks(bridge, state, ref_local, out_dir, size, hint, warnings, log=print):
+    """Copy the reference's background mask onto every photo (see COPY_MASK_KEYS)."""
+    values = reference_background_mask(ref_local)
+    if values is None:
+        log("Copy masks: the reference has no background mask to copy")
+        return
+    mask_dir = out_dir / "masks"
+    mask_dir.mkdir(exist_ok=True)
+    no_temp = {k: v for k, v in values.items() if k not in ("LocalTemperature", "LocalTint")}
+    for pid, s in state.items():
+        before, base = s["final_metrics"], _colour_error(s, s["final_metrics"])
+        tries = [values] + ([no_temp] if no_temp and no_temp != values else [])
+        kept = None
+        for n, local in enumerate(tries):
+            try:
+                result = bridge.mask_adjust(pid, "background", local)
+            except Exception as e:  # noqa: BLE001 - Lightroom's Develop module can refuse; the run goes on
+                warnings.append(f"Couldn't copy the background mask to {s['photo']['fileName']}: {e}")
+                break
+            if not result.get("found"):
+                warnings.append(f"Lightroom didn't keep the background mask on {s['photo']['fileName']}")
+                break
+            path = mask_dir / f"{n:02d}_{_safe(s['photo'])}.jpg"
+            bridge.render([{"id": pid, "path": str(path)}], size=size)
+            m = measure_file(path, hint)
+            after = _colour_error(s, m)
+            if after <= base + SHOOT_TONE_COLOUR_SLACK:
+                kept = local
+                s["final_metrics"], s["preview"] = m, str(path)
+                s["masks"] = {**(s.get("masks") or {}), "background": dict(local)}
+                s["copied_masks"] = {"background": dict(local), "colour_error": [round(base, 2), round(after, 2)]}
+                break
+            log(f"{s['photo']['fileName']}: copied background mask made the colour worse ({base:.1f} -> {after:.1f})")
+        if kept is None and s.get("copied_masks") is None:
+            try:
+                bridge.mask_adjust(pid, "background", {k: 0.0 for k in values})
+            except Exception:  # noqa: BLE001
+                pass
+            s["final_metrics"] = before
+        elif kept is not values:
+            log(f"{s['photo']['fileName']}: background mask copied without its Temperature")
 
 
 def same_shoot(ref, target):
@@ -2522,6 +2654,13 @@ def main(argv=None):
                    help="leave cream, gold, sand and dry grass out of the neutral reading (experimental)")
     m.add_argument("--bright-neutrals", action="store_true",
                    help="count bright whites (window-lit curtains) as neutrals, up to L* 95 (experimental)")
+    m.add_argument("--face-tone", action="store_true",
+                   help="photos from the reference's shoot whose faces are darker than the reference's are "
+                        "brightened toward them, even when the frame reads as another scene (turns on "
+                        "--face-skin; experimental)")
+    m.add_argument("--copy-masks", action="store_true",
+                   help="copy the reference's background mask (inverted Select Subject) onto every photo, "
+                        "through Lightroom's AI masks (slow; experimental)")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -2560,7 +2699,8 @@ def main(argv=None):
                                grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
                                hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue,
                                even_shoot_tone=args.even_shoot_tone, neutral_no_warm=args.neutral_no_warm,
-                               bright_neutrals=args.bright_neutrals, **subject_kwargs(args))
+                               bright_neutrals=args.bright_neutrals, face_tone=args.face_tone,
+                               copy_masks=args.copy_masks, **subject_kwargs(args))
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,

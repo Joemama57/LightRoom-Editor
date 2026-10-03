@@ -1039,14 +1039,16 @@ def test_a_gold_wall_frame_is_judged_by_its_whites_not_its_overall_brightness(tm
     ref = photo(capture(make_scene(seed=0), 3000), "DSC1416.ARW", settings={**REF_SETTINGS, "Temperature": 3000})
     ref["captureTime"] = 0.0
     scene = make_scene(seed=1)[4:, 2:].copy()
-    half = scene.shape[0] // 2
-    scene[:half] = [0.75, 0.45, 0.06]  # gold
-    scene[half:] *= 0.5  # whites and greys that came out dull
+    # Gold on 40% of the frame: on the real run the frames kept 68-86% of the
+    # reference's share of whites (contact-sheet tiles), well within SHOOT_TONE_LIGHT_SHARE.
+    gold = int(scene.shape[0] * 0.4)
+    scene[:gold] = [0.75, 0.45, 0.06]  # gold
+    scene[gold:] *= 0.5  # whites and greys that came out dull
     target = photo(capture(scene, 3000), "DSC1475.ARW", settings={"WhiteBalance": "As Shot", "Temperature": 3000, "Tint": 0})
     target["captureTime"] = 60.0
     lr = FakeLightroom({"ref": ref, "t": target}, active="ref")
     (p,) = run_match(lr, tmp_path, even_shoot_tone=True, log=quiet)["photos"]
-    assert p["trace"][0]["p50"] > p["shoot_tone"]["reference"]["p50"] + 10  # bright overall...
+    assert p["trace"][0]["p50"] > p["shoot_tone"]["reference"]["p50"] + 3  # brighter overall...
     assert p["shoot_tone"]["judged_on"] == "whites"
     assert p["final"]["Exposure2012"] > 0.2  # ...but brightened, toward the reference's whites
     assert abs(p["shoot_tone"]["after"]["level"] - p["shoot_tone"]["reference"]["level"]) < 2.0
@@ -1245,3 +1247,68 @@ def test_the_contact_sheet_says_an_error_is_after_the_users_nudge(lightroom, tmp
     run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Temperature=+300"]))
     sheet = workflow._tiles(json.loads((tmp_path / "report.json").read_text()), "preview")
     assert sum("after your nudge" in t["subtitle"] for t in sheet) == 1
+
+
+def test_whites_judge_brightness_only_when_both_frames_show_a_similar_share():
+    """Corridor run 20261004-013517: the reference was 54% cream walls, the frames
+    of the bride by a lit white wall 22% or less; those are judged on mid-tones."""
+    from engine.measure import Metrics
+    L = {"p1": 5.0, "p25": 30.0, "p50": 50.0, "p75": 70.0, "p99": 90.0}
+    ref = Metrics(a=0.0, b=0.0, L=L, clipped_fraction=0.0, neutral_fraction=0.3, light_L=57.0, light_fraction=0.54)
+    lit_wall = Metrics(a=0.0, b=0.0, L=L, clipped_fraction=0.0, neutral_fraction=0.3, light_L=66.0, light_fraction=0.22)
+    alike = Metrics(a=0.0, b=0.0, L=L, clipped_fraction=0.0, neutral_fraction=0.3, light_L=60.0, light_fraction=0.4)
+    old_report = Metrics(a=0.0, b=0.0, L=L, clipped_fraction=0.0, neutral_fraction=0.3, light_L=60.0)
+    assert not workflow._whites_comparable(ref, lit_wall)
+    assert workflow._whites_comparable(ref, alike)
+    assert workflow._whites_comparable(ref, old_report)  # no share recorded: as before
+
+
+def test_the_references_background_mask_is_read_in_slider_units():
+    corridor = [
+        {"kind": "MaskGroupBasedCorrections", "name": "Mask 1",
+         "masks": [{"What": "Mask/Image", "MaskSubType": 1, "MaskName": "Subject 1", "MaskValue": 1,
+                    "MaskInverted": True}],
+         "values": {"LocalHighlights2012": 0.281379, "LocalExposure2012": 0.048472, "LocalCurveRefineSaturation": 100,
+                    "LocalTemperature": -0.145086, "LocalBlacks2012": 0.093089}},
+        {"kind": "MaskGroupBasedCorrections", "name": "Mask 2",
+         "masks": [{"What": "Mask/Image", "MaskSubType": 0, "MaskName": "Person 1 - Clothes", "MaskInverted": False}],
+         "values": {"LocalSaturation": -0.099154}},
+    ]
+    assert workflow.reference_background_mask(corridor) == {
+        "LocalHighlights2012": 28.14, "LocalExposure2012": 0.05, "LocalTemperature": -14.51, "LocalBlacks2012": 9.31}
+    assert workflow.reference_background_mask(corridor[1:]) is None  # a subject (clothes) mask isn't background
+    assert workflow.reference_background_mask([]) is None
+
+
+def _with_background_mask(settings):
+    return {**settings, "MaskGroupBasedCorrections": [
+        {"CorrectionName": "Mask 1", "What": "Correction", "LocalTemperature": -0.145, "LocalHighlights2012": 0.28,
+         "CorrectionMasks": [{"What": "Mask/Image", "MaskSubType": 1, "MaskInverted": True}]}]}
+
+
+def test_copy_masks_gives_every_photo_the_references_background_mask(tmp_path):
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=_with_background_mask(REF_SETTINGS))
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    (p,) = run_match(lr, tmp_path, copy_masks=True, log=quiet)["photos"]
+    assert lr.mask_calls == [("t", "background", {"LocalTemperature": -14.5, "LocalHighlights2012": 28.0})]
+    assert p["masks"] == {"background": {"LocalTemperature": -14.5, "LocalHighlights2012": 28.0}}
+    assert p["copied_masks"]["background"] == p["masks"]["background"]
+
+
+def test_masks_are_not_copied_by_default(tmp_path):
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=_with_background_mask(REF_SETTINGS))
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    (p,) = run_match(lr, tmp_path, log=quiet)["photos"]
+    assert lr.mask_calls == [] and "masks" not in p
+
+
+def test_a_copied_mask_that_makes_the_colour_worse_is_tried_without_temperature_then_removed(tmp_path, monkeypatch):
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=_with_background_mask(REF_SETTINGS))
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    errors = iter([2.0, 5.0, 4.0])  # before, with the full mask, without its Temperature
+    monkeypatch.setattr(workflow, "_colour_error", lambda s, m: next(errors, 2.0))
+    workflow._copy_reference_masks(lr, {"t": {"photo": lr.photos["t"] | {"id": "t"}, "final_metrics": None}},
+                                   workflow.local_corrections(ref["settings"]), tmp_path, 256, None, [], quiet)
+    assert [c[2] for c in lr.mask_calls] == [{"LocalTemperature": -14.5, "LocalHighlights2012": 28.0},
+                                            {"LocalHighlights2012": 28.0},
+                                            {"LocalTemperature": 0.0, "LocalHighlights2012": 0.0}]
