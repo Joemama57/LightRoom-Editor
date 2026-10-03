@@ -81,6 +81,20 @@ SHOOT_OUTLIER_MIN_PHOTOS = 3
 # wb_from_reference); off by default until replayed real runs show it helps.
 SHOOT_HOLD_MIRED = 0.0
 SHOOT_HOLD_TINT = 0.0
+# A raw from the shoot with exactly the camera reading the reference's offset was
+# read from (a camera set to a fixed white balance) is in the reference's light: it
+# starts at the user's own choice and stays within SAME_READING_MIRED / _TINT of it
+# (flag wb_held_same_reading), however small the user's offset was. Two runs in a
+# row had every such solve walk 16-20 mired cooler than the camera, onto the
+# SAME_SHOOT_MIRED limit, while the user's choice was right: sand, gold and cream
+# outfits read as yellow greys (beach, 20261004-004044), and lamp-lit sheets were
+# matched to the window-daylit curtain and carpet of the reference (hotel room,
+# 20261004-005531: 4254-4331 K against the user's 4850 K).
+SAME_READING_MIRED = 5.0
+SAME_READING_TINT = 3.0
+# The shoot's median move is no guide when it sits on the SAME_SHOOT_MIRED limit
+# (within this many mired): most frames were fooled by their content the same way.
+SHOOT_OUTLIER_WALL = 1.0
 # A shoot is not always evened out by the camera: in a ceremony shot on manual
 # exposure, frames toward the stage lights come out brighter and frames of the crowd
 # darker (run 20261003-230103: mid-tones 52 and 72-76 against the reference's 61,
@@ -191,6 +205,18 @@ CALM_TOLERANCE = 1.0
 # lowers a photo's skin chroma by more than this (when both renders have
 # reliable skin) is not used; the strongest step that stays inside it is.
 CALM_SKIN_LOSS = 1.5
+# The extra colour is the frame's content, not too strong a grade, when its skin is
+# no more colourful than the reference's: a pink dress and orange walls filling a
+# close-up (DSC00200, run 20261004-005531) or a red floral arch (DSC00174, run
+# 20261004-004044) set off the calm, which drained faces and gold in both, and the
+# user's own finals kept the colour. Such a photo keeps the reference's Vibrance
+# and Saturation.
+CALM_SKIN_CONTENT = True
+# Pixels the colour model calls skin covering more than this share of the frame are
+# mostly walls, wood or gold, not faces (hotel room run 20261004-005531: 25-38%,
+# almost all wall panels), unless faces were actually detected. Their brightness
+# doesn't say how bright the faces are.
+SKIN_FACE_MAX_FRACTION = 0.25
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -538,8 +564,10 @@ def _run_match(
     # balance and exposure, matched on neutrals and mid-tones.
     light_only = (grade_fit is not None or style) and not color_only
     ref_offset = None if color_only else reference_wb_offset(ref, targets)
-    if ref_offset and abs(ref_offset["mired"]) <= SAME_SHOOT_MIRED:
-        ref_offset = None  # the reference is near what its camera saw: nothing to carry
+    # A reference near what its camera saw still says what the user chose for this
+    # light: it is carried to photos in that light (same minutes or same camera
+    # reading), but says nothing about how far other light may move.
+    big_offset = bool(ref_offset) and abs(ref_offset["mired"]) > SAME_SHOOT_MIRED
     if ref_offset:
         log(f"Reference white balance is {ref_offset['mired']:+.0f} mired, Tint {ref_offset['tint']:+.0f} from the "
             f"camera's (read off {ref_offset['from']}); carrying that to the photos")
@@ -560,6 +588,12 @@ def _run_match(
             elif t_raw and ref_raw and hold_shoot_wb:
                 limits_wb = (SHOOT_HOLD_MIRED, SHOOT_HOLD_TINT)
                 flags_wb = ["wb_from_reference"]
+            elif t_raw and ref_raw:
+                # It starts from the reference's white balance, the user's choice for this
+                # light: no further than a camera reading may move (DSC00128 went to 6106 K
+                # against 4956 K on run 20261004-004044).
+                limits_wb = (SAME_SHOOT_MIRED if limits_wb[0] is None else min(limits_wb[0], SAME_SHOOT_MIRED),
+                             limits_wb[1])
         elif other_format:
             tone_limits = (Options().tone_limits[0], SHOOT_OTHER_FORMAT_TONE)
             limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
@@ -567,7 +601,8 @@ def _run_match(
             tone_limits = Options().tone_limits
         offset_applied = False
         if ref_offset and t_raw and wb_from_camera and camera == ref.get("cameraModel"):
-            if _shot_together(ref, t, REF_AS_SHOT_MINUTES / 60) or (shoot and _same_reading(ref_offset, start)):
+            same_reading = shoot and _same_reading(ref_offset, start)
+            if _shot_together(ref, t, REF_AS_SHOT_MINUTES / 60) or same_reading:
                 # Same light as the reference: the user's white-balance choice, from its own camera reading.
                 # A later photo of the shoot with exactly the same camera reading counts too: the camera
                 # was set to a fixed white balance (3900 K / +10 for a whole ceremony, run 20261003-234416),
@@ -581,7 +616,10 @@ def _run_match(
                     # gold walls and coloured drapes have no greys for the solve to read.
                     limits_wb = (SHOOT_HOLD_MIRED, SHOOT_HOLD_TINT)
                     flags_wb = ["wb_from_reference"]
-            else:
+                elif same_reading:
+                    limits_wb = (SAME_READING_MIRED, SAME_READING_TINT)
+                    flags_wb = ["wb_held_same_reading"]
+            elif big_offset:
                 # Other light: its own camera reading, but free to reach the reference's choice.
                 gap = abs(1e6 / float(ref["settings"]["Temperature"]) - 1e6 / start["Temperature"])
                 limits_wb = (max(limits_wb[0], gap + SAME_SHOOT_MIRED), limits_wb[1])
@@ -676,7 +714,7 @@ def _run_match(
     # about your taste for this camera and kind of light.
     for s in state.values():
         s["matched"] = blend(s["start"], s["proposal"].sliders, strength, s["is_raw"])
-    _pull_shoot_outliers(state, log)
+    _pull_shoot_outliers(state, log, tolerance)
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
@@ -743,7 +781,7 @@ def _run_match(
             # Judge it on colour alone: its brightness differs by content.
             color_error = match_error(ref_metrics, s["final_metrics"], color_only=True)
             # Held at the reference's white balance: what colour gap is left is its content.
-            held = "wb_from_reference" in s["extra_flags"]
+            held = bool({"wb_from_reference", "wb_held_same_reading"} & set(s["extra_flags"]))
             if (color_error < tolerance or held) and "not_converged" in s["flags"]:
                 s["flags"].remove("not_converged")
         elif faces_set:
@@ -826,12 +864,23 @@ def _run_match(
             "flags": s["flags"] + s["extra_flags"],
             "skin": t_skin,
             "skin_vs_reference": skin_model.compare(ref_skin, t_skin) if ref_skin and t_skin else None,
+            "skin_note": _skin_note(s["final_metrics"]),
+            "final_error_with_tone": (round(match_error(s["target"], s["final_metrics"], skin=s["options"].skin), 2)
+                                      if s["same_shoot"] and not s["options"].color_only else None),
             "start_preview": s["history"][0]["preview"],
             "preview": s["preview"],
         })
     _label_flagged(bridge, report, label)
     _write_outputs(out_dir, report)
     return report
+
+
+def _skin_note(m):
+    """Where the skin readings came from, when it wasn't faces."""
+    if m.skin_L is None or m.skin_source == "faces":
+        return None
+    return ("skin read from skin-coloured areas (no faces found): walls, wood, gold or sand can count as skin"
+            + (f" ({m.skin_fraction:.0%} of the frame)" if m.skin_fraction > SKIN_FACE_MAX_FRACTION else ""))
 
 
 def _trace(s, ref_metrics):
@@ -931,6 +980,8 @@ def _face_gap(ref_metrics, m, s):
         return None
     if _false_skin(ref_metrics, m):
         return None
+    if any(x.skin_source != "faces" and x.skin_fraction > SKIN_FACE_MAX_FRACTION for x in (ref_metrics, m)):
+        return None  # walls and wood, not faces
     return m.skin_L - ref_metrics.skin_L
 
 
@@ -1065,6 +1116,11 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
             continue
         cur, masks = look_stage.measure_look_file_with_masks(s["preview"])
         if min(cur["chroma"][k] / max(ref_chroma[k], 1e-6) for k in ("mean", "top")) < CALM_RATIO:
+            continue
+        skin_chroma = _skin_chroma(s["final_metrics"])
+        if CALM_SKIN_CONTENT and ref_skin_chroma is not None and skin_chroma is not None and skin_chroma <= ref_skin_chroma:
+            log(f"{s['photo']['fileName']}: more colourful than the reference, but not in its skin "
+                f"({skin_chroma:.0f} against {ref_skin_chroma:.0f}): its content; colour left as the reference's")
             continue
         s["calm_masks"], s["calm_done"], s["calm_offsets"] = masks, False, {}
         s["calm_history"] = [{"offsets": {}, "look": cur, "preview": s["preview"], "metrics": s["final_metrics"]}]
@@ -1354,11 +1410,17 @@ def _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warni
             _apply(bridge, undo, warnings, log)
 
 
-def _pull_shoot_outliers(state, log=print):
+def _pull_shoot_outliers(state, log=print, tolerance=None):
     """Raws from the reference's shoot share its light, so their white balance
     should move alike. One whose move is far from the shoot's median move
     followed its content instead: give it the shoot's move (from its own
-    camera white balance) and flag it wb_from_shoot."""
+    camera white balance) and flag it wb_from_shoot.
+
+    Not when the median itself sits on the SAME_SHOOT_MIRED limit (most frames
+    were fooled alike), nor for a photo already within `tolerance` at its start
+    or held at the user's choice: on run 20261004-004044 the two frames with the
+    cleanest greys (DSC00143 at 1.42, DSC00280) were pulled onto the beach's
+    sand-fooled median and both got worse."""
     shoot = [s for s in state.values() if s.get("shoot_wb")]
     if len(shoot) < SHOOT_OUTLIER_MIN_PHOTOS:
         return
@@ -1368,15 +1430,32 @@ def _pull_shoot_outliers(state, log=print):
         moves[id(s)] = (x1[0] - x0[0], x1[1] - x0[1])
     median_temp = float(np.median([m[0] for m in moves.values()]))
     median_tint = float(np.median([m[1] for m in moves.values()]))
+    if abs(median_temp) >= SAME_SHOOT_MIRED - SHOOT_OUTLIER_WALL:
+        log(f"The shoot's white-balance moves sit on the {SAME_SHOOT_MIRED:.0f} mired limit (median "
+            f"{median_temp:+.0f}): its content, not its light; no photo is pulled to it")
+        return
     for s in shoot:
         if abs(moves[id(s)][0] - median_temp) <= SHOOT_OUTLIER_MIRED:
             continue
+        if {"wb_from_reference", "wb_held_same_reading"} & set(s["extra_flags"]):
+            continue
+        if tolerance is not None and _start_error(s) is not None and _start_error(s) < tolerance:
+            continue  # already right at its own camera reading
         x = _to_internal(s["matched"], True)
         x0 = _to_internal(s["start"], True)
         x[0], x[1] = x0[0] + median_temp, x0[1] + median_tint
         s["matched"] = _to_sliders(x, True)
         s["extra_flags"].append("wb_from_shoot")
         log(f"{s['photo']['fileName']}: white balance followed the content; using the shoot's instead")
+
+
+def _start_error(s):
+    """The error of a photo's first render, as the solve judged it (None without one)."""
+    if not s.get("history"):
+        return None
+    o = s["options"]
+    return match_error(s["target"], s["history"][0]["metrics"], skin=o.skin,
+                       color_only=o.color_only or o.judge_colour, light_only=o.light_only)
 
 
 def _stem(name):
@@ -2098,9 +2177,15 @@ def _rerender(bridge, run_dir, report, p, tag):
     metrics = measure_file(path, (ref_metrics.a, ref_metrics.b))
     opts = report.get("options", {})
     p["preview"] = str(path)
+    # The error the run reported, before the first nudge: a deliberate warm-up
+    # then reads as "after your nudge", not as the photo getting worse.
+    p.setdefault("error_before_nudge", p.get("final_error"))
     p["final_error"] = round(match_error(ref_metrics, metrics, skin=opts.get("skin", False),
-                                         color_only=opts.get("color_only", False),
+                                         # judged as the run judged it: colour alone for the reference's shoot
+                                         color_only=opts.get("color_only", False) or (
+                                             "same_shoot" in p.get("flags", []) and "different_file_type" not in p.get("flags", [])),
                                          light_only=opts.get("light_only", False)), 2)
+    p["error_note"] = "after your nudge"
     p["skin"] = _skin(metrics)
     ref_skin = report["reference"].get("skin")
     p["skin_vs_reference"] = skin_model.compare(ref_skin, p["skin"]) if ref_skin and p["skin"] else None

@@ -661,11 +661,23 @@ def test_a_later_photo_can_reach_the_references_white_balance(tmp_path):
     assert _mired(later["final"]["Temperature"]) - _mired(5500) > 80  # past the usual limit, toward 3000 K
 
 
-def test_a_reference_near_its_camera_reading_carries_nothing(tmp_path):
-    report = run_match(_stage(5500, {"mate": (30.0, 5600)}), tmp_path, log=quiet)
-    assert report["reference_wb_offset"] is None
-    (p,) = report["photos"]
-    assert p["start"]["Temperature"] == 5600 and "wb_offset_from_reference" not in p["flags"]
+def test_a_reference_near_its_camera_reading_is_still_carried_and_held(tmp_path):
+    """Runs 20261004-004044 and -005531: the user's choice was 2-9 mired from the camera,
+    and dropping it as too small let every frame be solved cooler from its content."""
+    report = run_match(_stage(5500, {"mate": (30.0, 5600), "later": (1800.0, 5600)}), tmp_path, log=quiet)
+    assert report["reference_wb_offset"]["mired"] == pytest.approx(3.2, abs=0.1)
+    for p in report["photos"]:
+        assert {"wb_offset_from_reference", "wb_held_same_reading"} <= set(p["flags"])
+        assert p["start"]["Temperature"] == pytest.approx(5500, abs=1)
+        assert abs(_mired(p["final"]["Temperature"]) - _mired(p["start"]["Temperature"])) <= 5 + 0.5
+        assert abs(p["final"]["Tint"] - p["start"]["Tint"]) <= 3 + 1e-6
+
+
+def test_a_small_offset_does_not_widen_the_limits_of_other_light(tmp_path):
+    report = run_match(_stage(5500, {"mate": (30.0, 5600), "other": (1800.0, 4000)}), tmp_path, log=quiet)
+    other = next(p for p in report["photos"] if p["id"] == "other")
+    assert "wb_offset_from_reference" not in other["flags"] and "wb_held_same_reading" not in other["flags"]
+    assert abs(_mired(other["final"]["Temperature"]) - _mired(4000)) <= 20 + 0.5  # the usual shoot limit
 
 
 def test_without_a_photo_from_the_references_minutes_nothing_is_carried(tmp_path):
@@ -1084,3 +1096,79 @@ def test_the_report_lists_the_references_local_adjustments_it_did_not_copy(tmp_p
 def test_evening_the_shoots_brightness_is_on_by_default(tmp_path):
     (p,) = run_match(_ceremony({"walls": 1.2}), tmp_path, log=quiet)["photos"]
     assert "tone_from_shoot" in p["flags"]
+
+
+# Runs 20261004-004044 (beach) and 20261004-005531 (hotel room): safe-by-default fixes.
+
+def test_the_shoot_median_on_the_limit_pulls_nobody():
+    from engine.workflow import _pull_shoot_outliers
+    state = _shoot_state([(20, -8), (20, 0), (20, -2), (19.8, -7), (-2, 0)])  # most fooled to the 20 mired wall
+    before = {k: dict(s["matched"]) for k, s in state.items()}
+    _pull_shoot_outliers(state, quiet)
+    assert all(s["matched"] == before[k] and not s["extra_flags"] for k, s in state.items())
+
+
+def test_a_photo_right_at_its_start_or_held_is_not_pulled_to_the_shoot(monkeypatch):
+    import engine.workflow as wf
+    state = _shoot_state([(8, -8), (14, 0), (6, -7), (-6, -2), (-44, 12), (-40, 10)])
+    monkeypatch.setattr(wf, "_start_error", lambda s: 1.0 if s is state["4"] else 3.0)
+    state["5"]["extra_flags"] = ["wb_held_same_reading"]
+    before = {k: dict(s["matched"]) for k, s in state.items()}
+    wf._pull_shoot_outliers(state, quiet, tolerance=2.0)
+    assert state["4"]["matched"] == before["4"] and state["4"]["extra_flags"] == []  # already within tolerance
+    assert state["5"]["matched"] == before["5"] and state["5"]["extra_flags"] == ["wb_held_same_reading"]
+
+
+def test_a_rematched_raw_from_the_shoot_moves_at_most_the_shoot_limit(tmp_path):
+    report = run_match(_resynced_beach(1800.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert not p["wb_from_camera"] and "wb_from_reference" not in p["flags"]
+    assert abs(_mired_move(p)) <= 20 + 0.5
+
+
+def _skin_metrics(source, fraction, L=60.0):
+    from engine.measure import Metrics
+    return Metrics(a=0.0, b=0.0, L={"p1": 5.0, "p25": 30.0, "p50": 50.0, "p75": 70.0, "p99": 90.0},
+                   clipped_fraction=0.0, neutral_fraction=0.3, skin_a=14.0, skin_b=30.0, skin_fraction=fraction,
+                   skin_L=L, skin_source=source)
+
+
+def test_skin_covering_a_quarter_of_the_frame_is_not_taken_for_faces():
+    from engine.workflow import _face_gap, _skin_note
+    s = {"extra_flags": []}
+    ref = _skin_metrics(None, 0.10, L=55.0)
+    assert _face_gap(ref, _skin_metrics(None, 0.12), s) == pytest.approx(5.0)
+    assert _face_gap(ref, _skin_metrics(None, 0.38), s) is None  # wall panels
+    assert _face_gap(_skin_metrics(None, 0.29, L=55.0), _skin_metrics(None, 0.12), s) is None
+    assert _face_gap(ref, _skin_metrics("faces", 0.38), s) == pytest.approx(5.0)  # detected faces are faces
+    assert "no faces found" in _skin_note(_skin_metrics(None, 0.38)) and "38%" in _skin_note(_skin_metrics(None, 0.38))
+    assert _skin_note(_skin_metrics("faces", 0.38)) is None
+
+
+def test_colourful_content_with_pale_skin_is_not_calmed(tmp_path):
+    ref_scene = make_scene(seed=0).copy()
+    ref_scene[10:50, 30:70] = (0.42, 0.24, 0.16)  # faces
+    t_scene = _colourful(make_scene(seed=1)[4:, 2:], 2.0)
+    t_scene[10:50, 30:70] = (0.36, 0.28, 0.24)  # paler faces among the colourful dress and walls
+    ref = photo(capture(ref_scene, 5500), "A.ARW", settings=dict(REF_SETTINGS, Vibrance=20, Saturation=3))
+    t = photo(capture(t_scene, 5500), "B.ARW")
+    lr = FakeLightroom({"ref": ref, "t": t}, active="ref")
+    messages = []
+    (p,) = run_match(lr, tmp_path, log=messages.append)["photos"]
+    assert "calmer_colour" not in p["flags"]
+    assert lr.photos["t"]["settings"]["Vibrance"] == 20
+    assert any("not in its skin" in m for m in messages)
+
+
+def test_the_report_gives_a_same_shoot_photos_error_with_tone_too(tmp_path):
+    report = run_match(_stage(3000, {"mate": (30.0, 5500)}), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" in p["flags"] and p["final_error_with_tone"] >= p["final_error"] - 1e-6
+
+
+def test_a_nudge_keeps_the_runs_error_and_says_it_is_after_the_nudge(lightroom, tmp_path):
+    report = run_match(lightroom, tmp_path, log=quiet)
+    before = next(p for p in report["photos"] if p["id"] == "under")["final_error"]
+    run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Tint=-2"]))
+    p = run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Tint=+2"]))
+    assert p["error_before_nudge"] == before and p["error_note"] == "after your nudge"
