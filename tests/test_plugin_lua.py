@@ -209,7 +209,7 @@ def test_json_round_trip(lua_env):
     doc = {
         "id": "abc", "n": 5500, "f": -0.25, "big": 1e20, "t": True, "fl": False,
         "arr": [0, 10, 64.5, 255], "nested": {"k": ["x", {"y": 1}]}, "empty": {},
-        "s": 'quote " backslash \\ newline \n tab \t unicode é 😀',
+        "s": 'quote " backslash \\ newline \n tab \t unicode é € 日本 😀',
     }
     lua_value = Json.decode(json.dumps(doc))
     back = json.loads(Json.encode(lua_value))

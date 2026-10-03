@@ -12,8 +12,11 @@ local escapes = {
 	["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t",
 }
 
+-- Control bytes are listed explicitly: %c follows the C locale, and on macOS
+-- in a UTF-8 locale it also matches 0x80-0x9F, which are continuation bytes
+-- of characters such as emoji or "€", and escaping them corrupts the text.
 local function encodeString(s)
-	return '"' .. s:gsub('[%c"\\]', function(c)
+	return '"' .. s:gsub('[%z\1-\31\127"\\]', function(c)
 		return escapes[c] or string.format("\\u%04x", c:byte())
 	end) .. '"'
 end
