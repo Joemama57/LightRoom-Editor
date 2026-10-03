@@ -343,3 +343,83 @@ def test_dark_led_interior_is_not_blown_out(lightroom, tmp_path):
     for p in report["photos"]:
         if p["id"] != "led":
             assert "different_scene" not in p["flags"] and p["final_error"] < 2.0
+
+
+# -- guards against learning the wrong lesson -----------------------------------------
+
+def undo(lightroom, report):
+    """What Edit > Undo or the "Before Match Look" snapshot does: every photo back as it was."""
+    for _, name, settings in lightroom.snapshots:
+        if name == "Before Match Look":
+            lightroom.photos[_]["settings"] = dict(settings)
+
+
+def test_an_undone_run_teaches_nothing(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    report = run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    undo(lightroom, report)
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 0
+    assert learner.data["preference"] == {}
+    saved = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert saved["learned"].startswith("skipped: undone")
+
+
+def test_one_photo_undone_the_rest_still_learned(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    report = run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    before = {i: s for i, n, s in lightroom.snapshots}
+    lightroom.photos["shade"]["settings"] = dict(before["shade"])  # this one put back
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    lightroom.photos["tung"]["settings"]["Tint"] = tung["matched"]["Tint"] + 6  # a real edit
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 1
+    assert len(learner.data["preference"]) == 1
+
+
+def test_repeating_the_same_edit_after_a_rerun_is_not_an_undo(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    for n in range(2):
+        report = run_match(lightroom, tmp_path / f"{n}", learner=learner, log=quiet)
+        tung = next(p for p in report["photos"] if p["id"] == "tung")
+        lightroom.photos["tung"]["settings"]["Temperature"] = tung["matched"]["Temperature"] + 250
+    assert learn_from_run(lightroom, tmp_path / "1", learner, quiet) == 1
+
+
+def test_a_bad_run_teaches_no_taste(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lightroom, tmp_path / "run", learner=learner, log=quiet)
+    path = tmp_path / "run" / "report.json"
+    report = json.loads(path.read_text())
+    for p in report["photos"]:
+        p["flags"] = ["not_converged"]  # a run that went badly
+    path.write_text(json.dumps(report))
+    lightroom.photos["tung"]["settings"]["Tint"] += 6
+    assert learn_from_run(lightroom, tmp_path / "run", learner, quiet) == 0
+    assert learner.data["preference"] == {}
+    assert json.loads(path.read_text())["learned"] == "skipped: 3 of 3 photos were flagged"
+
+
+def test_learning_is_backed_up_and_can_be_restored(lightroom, tmp_path):
+    learner = Learner(tmp_path / "learning.json")
+    run_match(lightroom, tmp_path / "a", learner=learner, log=quiet)
+    first = json.loads((tmp_path / "learning.json").read_text())
+    run_match(lightroom, tmp_path / "b", learner=learner, log=quiet)
+    backup = tmp_path / "b" / "learning_before.json"
+    assert json.loads(backup.read_text()) == first
+    learner.restore(backup)
+    assert json.loads((tmp_path / "learning.json").read_text()) == first
+    assert (tmp_path / "learning.json.bak").exists()
+    assert learner.data["runs"] == first["runs"]
+
+
+def test_learn_skip_marks_the_run_and_learns_nothing(lightroom, tmp_path, monkeypatch):
+    import engine.workflow as wf
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(wf, "RUNS_DIR", runs)
+    monkeypatch.setenv("MATCHLOOK_HOME", str(tmp_path))
+    report = run_match(lightroom, runs / "01", log=quiet)
+    tung = next(p for p in report["photos"] if p["id"] == "tung")
+    lightroom.photos["tung"]["settings"]["Tint"] = tung["matched"]["Tint"] + 6
+    monkeypatch.setattr(wf, "Bridge", lambda: lightroom)
+    assert wf.main(["learn", "--skip"]) == 0
+    assert json.loads((runs / "01" / "report.json").read_text())["learned"] == "skipped: by user"
+    assert not (tmp_path / "learning.json").exists()

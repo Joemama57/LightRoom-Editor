@@ -34,7 +34,7 @@ from . import look as look_stage
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
 from .guards import MOSTLY_CLIPPED, different_scene, flags_for
-from .learning import Learner, light_bucket
+from .learning import Learner, light_bucket, same_light
 from .colorspace import delta_e_2000, srgb_to_lab
 from .measure import Metrics, load_image, measure_file
 from .settings import is_raw, split, starting_corrective
@@ -106,34 +106,114 @@ def latest_unlearned_run(runs_dir, exclude=None):
     return None
 
 
-def learn_from_run(bridge, run_dir, learner, log=print):
+# A run is too unreliable to learn taste from when more than this share of its
+# photos was flagged, or its fitted grade stayed this far from the reference:
+# edits made to such a run fix the engine's mistakes, they aren't taste.
+UNRELIABLE_FLAGGED = 0.5
+UNRELIABLE_GRADE_DE = 6.0
+UNDONE_SHARE = 0.5  # this share of photos back at their pre-match settings = the run was undone
+
+
+def unreliable_reason(report):
+    photos = report.get("photos") or []
+    flagged = sum(1 for p in photos if REVIEW_FLAGS & set(p.get("flags") or []))
+    if photos and flagged / len(photos) > UNRELIABLE_FLAGGED:
+        return f"{flagged} of {len(photos)} photos were flagged"
+    fit = report.get("grade_fit") or {}
+    if (fit.get("delta_e_after") or 0) > UNRELIABLE_GRADE_DE:
+        return f"the grade fit stayed {fit['delta_e_after']} away from the reference"
+    return None
+
+
+def _look_fingerprint(settings, keys):
+    """Short hash of the given creative settings, to tell whether a photo still
+    carries the look a run wrote or was put back to its own."""
+    import hashlib
+
+    def norm(v):
+        return round(float(v), 2) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+    blob = json.dumps({k: norm((settings or {}).get(k)) for k in sorted(keys)}, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def _was_undone(p, settings, report):
+    """Put back to how it was before the match (Edit > Undo, or the "Before
+    Match Look" snapshot): its light is back at `before` and so is its look.
+    A user who edits a photo keeps the run's look, so that isn't an undo."""
+    if not p.get("before"):
+        return False
+    # A slider missing from the photo's settings is at its default, as `before` records it.
+    light = {k: settings.get(k, p["before"][k]) for k in CORRECTIVE}
+    if not same_light(light, p["before"], p["is_raw"]):
+        return False
+    if same_light(p["before"], p["matched"], p["is_raw"]):
+        return False  # nothing changed in the first place
+    keys = report.get("look_keys")
+    if not keys or not p.get("before_look"):
+        return True  # older report: judge by the light alone
+    now = _look_fingerprint(settings, keys)
+    return now == p["before_look"] and now != report.get("look_written")
+
+
+def _mark_learned(run_dir, report, value):
+    report["learned"] = value
+    (Path(run_dir) / "report.json").write_text(json.dumps(report, indent=2))
+
+
+def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
     """Compare a run's photos as they are in Lightroom now with what the match chose,
     and learn the differences (your edits after the match, and review nudges) as
-    preferences. Each run is learned from once."""
+    preferences. Each run is learned from once.
+
+    Guards against learning the wrong lesson:
+    - a photo put back to its pre-match settings (undo, "Before Match Look"
+      snapshot) is skipped; if most photos were, the run was undone and
+      nothing is learned;
+    - a run that went badly (most photos flagged, or a poor grade fit) isn't
+      learned from: edits to it correct the engine, they aren't taste.
+    The report records why a run was skipped. backup_to: where to back up
+    learning.json before changing it."""
     run_dir = Path(run_dir)
     report = json.loads((run_dir / "report.json").read_text())
     if report.get("learned"):
+        return 0
+    reason = unreliable_reason(report)
+    if reason:
+        _mark_learned(run_dir, report, f"skipped: {reason}")
+        log(f"Not learning from {run_dir.name}: {reason}")
         return 0
     try:
         current = {c["id"]: c["settings"] for c in bridge.get_settings([{"id": p["id"]} for p in report["photos"]])}
     except BridgeError as e:
         log(f"Couldn't read last run's photos to learn from them: {e}")
         return 0
-    learned = 0
+    candidates, undone = [], 0
     for p in report["photos"]:
         settings = current.get(p["id"])
         if not settings or "matched" not in p:
             continue
         kept = {k: settings.get(k, p["final"].get(k, 0.0)) for k in CORRECTIVE}
+        if _was_undone(p, settings, report):
+            undone += 1  # put back as it was before the match: not a preference
+            continue
+        candidates.append((p, kept))
+    total = undone + len(candidates)
+    if total and undone / total >= UNDONE_SHARE:
+        _mark_learned(run_dir, report, f"skipped: undone ({undone} of {total} photos back to before the match)")
+        log(f"Not learning from {run_dir.name}: it was undone")
+        return 0
+    learned = 0
+    for p, kept in candidates:
         bucket = p.get("light") or light_bucket(p["matched"], p["is_raw"])
         if learner.observe_correction(p.get("camera"), p["is_raw"], bucket, p["matched"], kept,
                                       allow_zero=True) == "correction":
             learned += 1
-    report["learned"] = True
-    (run_dir / "report.json").write_text(json.dumps(report, indent=2))
-    learner.save()
+    _mark_learned(run_dir, report, True)
+    learner.save(backup_to=backup_to)
     if learned:
         log(f"Learned from {learned} photo(s) adjusted after the last run ({run_dir.name})")
+    if undone:
+        log(f"Skipped {undone} photo(s) that were put back to how they were before the match")
     return learned
 
 
@@ -182,7 +262,7 @@ def run_match(
     if learner is not None:
         previous = latest_unlearned_run(runs_dir or out_dir.parent, exclude=out_dir)
         if previous:
-            learn_from_run(bridge, previous, learner, log)
+            learn_from_run(bridge, previous, learner, log, backup_to=out_dir / "learning_before.json")
 
     selection = bridge.get_selection()
     photos = {p["id"]: p for p in selection["photos"]}
@@ -244,8 +324,13 @@ def run_match(
             flags.append("different_camera")
         if t_raw != ref_raw:
             flags.append("different_file_type")
+        own = t.get("settings") or {}
         state[t["id"]] = {
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
+            # As it was before this run, to tell an undo from an edit later.
+            "before": {k: float(own.get(k, 0.0 if not (k == "Temperature" and t_raw) else 5500.0))
+                       for k in CORRECTIVE},
+            "before_look": _look_fingerprint(own, creative),
             "wb_from_camera": wb_from_camera,
             "options": Options(prior=prior, skin=skin, color_only=color_only,
                                wb_limits=wb_limits(t_raw, wb_from_camera), light_only=light_only),
@@ -348,7 +433,7 @@ def run_match(
         for s in state.values():
             learner.observe_history(s["camera"], s["is_raw"], s["history"])
         learner.end_run()
-        learner.save()
+        learner.save(backup_to=out_dir / "learning_before.json")
 
     ref_skin = _skin(ref_metrics)
     report = {
@@ -361,6 +446,9 @@ def run_match(
                     "light_only": light_only},
         "grade_fit": grade_fit,
         "baked_reference": bool(baked),
+        # To recognise an undone run later (see _was_undone).
+        "look_keys": sorted(creative),
+        "look_written": _look_fingerprint(creative, creative),
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
         "warnings": warnings,
         "reference": {"id": ref_id, "fileName": ref["fileName"], "preview": str(ref_path),
@@ -378,6 +466,8 @@ def run_match(
             "light": s["light"],
             "wb_from_camera": s["wb_from_camera"],
             "learned_sensitivities": s["prior_source"],
+            "before": s["before"],
+            "before_look": s["before_look"],
             "start": s["start"],
             "matched": s["matched"],
             "final": s["final"],
@@ -1031,7 +1121,7 @@ def run_calibrate(bridge, out_dir, learner, size=768, log=print):
             restore.append({"id": pid, "settings": keep})
         _apply(bridge, restore, warnings, log)
     learner.end_run()
-    learner.save()
+    learner.save(backup_to=out_dir / "learning_before.json")
     return {"photos": len(photos), "observations": pairs, "warnings": warnings,
             "learning": learner.summary()["sensitivity_samples"]}
 
@@ -1064,6 +1154,7 @@ def main(argv=None):
     n.add_argument("changes", nargs="+", help="e.g. Exposure2012=+0.2 Temperature=-150 Tint=+3")
     lr = sub.add_parser("learn", help="learn now from edits made to a run's photos in Lightroom")
     lr.add_argument("--run", help="run folder (default: the latest one not learned from yet)")
+    lr.add_argument("--skip", action="store_true", help="don't learn from that run at all (a bad run)")
     c = sub.add_parser("calibrate", help="measure Lightroom's slider response on the selected photos")
     c.add_argument("--out", help="folder for calibration renders")
     args = parser.parse_args(argv)
@@ -1096,8 +1187,12 @@ def main(argv=None):
             run = Path(args.run) if args.run else latest_unlearned_run(RUNS_DIR)
             if not run:
                 print("Nothing new to learn from.")
+            elif args.skip:
+                report = json.loads((run / "report.json").read_text())
+                _mark_learned(run, report, "skipped: by user")
+                print(json.dumps({"run": str(run), "learned": report["learned"]}, indent=2))
             else:
-                count = learn_from_run(bridge, run, learner, log)
+                count = learn_from_run(bridge, run, learner, log, backup_to=run / "learning_before.json")
                 print(json.dumps({"run": str(run), "photos_learned_from": count, **learner.summary()}, indent=2))
         else:
             out = Path(args.out) if args.out else RUNS_DIR.parent / "calibration" / time.strftime("%Y%m%d-%H%M%S")

@@ -22,7 +22,13 @@ Grade one photo, select the rest, and run `/match-look` in Claude Code. Every se
 - **Self-learning:**
   - Every run trains a per-camera model of how the sliders respond, so later runs need fewer passes.
   - Edits made after a match, by you in Lightroom or by Claude during review, are learned per camera and kind of light, then applied automatically once they repeat.
-  - Everything is stored in `~/.matchlook/learning.json`. See it with `python3 -m engine.learning show`, or clear it with `reset`.
+  - Everything is stored in `~/.matchlook/learning.json`. See it with `python3 -m engine.learning show`.
+  - **Guards against learning the wrong lesson:**
+    - Photos you put back to how they were (Edit ▸ Undo, or the "Before Match Look" snapshot) aren't learned from. If most of a run was undone, nothing from it is learned.
+    - Runs that went badly (most photos flagged, or a poor grade fit) aren't learned from: edits to them correct the engine, they aren't your taste.
+    - After a run you don't want taught, run `python3 -m engine.workflow learn --skip`.
+    - Every run backs up `learning.json` to its run folder first. `python3 -m engine.learning restore --run ~/.matchlook/runs/<time>` undoes everything learned since that run started (the current file is kept as `learning.json.bak`).
+    - `python3 -m engine.learning reset --preferences` forgets learned taste but keeps how your Lightroom's sliders respond. Plain `reset` forgets everything.
 - **Never copied:** crop, lens corrections, transforms, spot removal, masks, sharpening and noise reduction.
 - **Undo is easy:** every photo gets a **"Before Match Look"** snapshot, and everything stays a normal, editable Lightroom setting.
 - **Flagged photos:** photos that couldn't be matched well get a yellow label.
@@ -54,9 +60,9 @@ By hand:
 .venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--refit] [--look-per-photo] [--no-learning]
 .venv/bin/python -m engine.workflow nudge --run ~/.matchlook/runs/<time> --photo DSC0042 Exposure2012=+0.2 SaturationAdjustmentBlue=+8
 .venv/bin/python -m engine.workflow nudge --run ... --photo DSC0042 --mask subject Temperature=-10
-.venv/bin/python -m engine.workflow learn        # learn now from edits made since the last run
+.venv/bin/python -m engine.workflow learn [--skip] # learn now from edits made since the last run (or skip it)
 .venv/bin/python -m engine.workflow calibrate
-.venv/bin/python -m engine.learning show|reset
+.venv/bin/python -m engine.learning show | reset [--preferences] | restore --run DIR
 ```
 Each run writes `report.json`, `contact_sheet_before.jpg` and `contact_sheet.jpg` to `~/.matchlook/runs/<time>/`.
 

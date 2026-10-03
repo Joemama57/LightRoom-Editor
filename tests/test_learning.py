@@ -139,3 +139,11 @@ def test_summary_is_readable(learner):
     pref = s["preferences"]["raw|Sony|warm light"]
     assert pref["applied"] and pref["corrections"] == 3
     assert pref["average_change"]["Temperature"].startswith("warmer by")
+
+
+def test_reset_preferences_keeps_slider_response(learner):
+    simulated_runs(learner, [(3200, 0, 0), (7500, 5, 0.3), (5500, 0, -1.5), (2900, 0, -1.0)])
+    for _ in range(3):
+        learner.observe_correction("Sony", True, "warm light", MATCHED, warmer(MATCHED, 200))
+    learner.reset(preferences_only=True)
+    assert learner.data["preference"] == {} and learner.prior("Sony A7 IV", True)[0] is not None

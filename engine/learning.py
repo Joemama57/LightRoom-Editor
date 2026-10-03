@@ -18,12 +18,17 @@ Two things are learned.
    scaled by how consistent it has been.
 
     python3 -m engine.learning show
-    python3 -m engine.learning reset
+    python3 -m engine.learning reset [--preferences]
+    python3 -m engine.learning restore --run ~/.matchlook/runs/<time>
+
+Every run backs up learning.json to <run>/learning_before.json before it
+changes it, so one run's learning can be undone with `restore`.
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -58,6 +63,11 @@ def default_path():
     return root / "learning.json"
 
 
+def same_light(a, b, is_raw):
+    """True when two sets of corrective sliders differ by no more than noise."""
+    return not np.any(np.abs(_to_internal(a, is_raw) - _to_internal(b, is_raw)) >= PREF_MIN)
+
+
 def light_bucket(sliders, is_raw):
     """Rough kind of light, from the photo's solved white balance."""
     if not is_raw:
@@ -84,15 +94,37 @@ class Learner:
             except (OSError, ValueError):
                 pass  # a corrupt file just means starting fresh
 
-    def save(self):
+    def save(self, backup_to=None):
+        """Write learning.json. backup_to: a file to copy the previous
+        learning.json to first (once: an existing backup is kept), so this
+        run's learning can be undone with `restore`."""
+        if backup_to is not None and self.path.exists() and not Path(backup_to).exists():
+            Path(backup_to).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.path, backup_to)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=1))
         tmp.replace(self.path)
 
-    def reset(self):
-        self.data = {"version": 1, "sensitivity": {}, "preference": {}, "runs": 0, "corrections": 0}
+    def reset(self, preferences_only=False):
+        """Forget everything, or (preferences_only) only the learned taste,
+        keeping how Lightroom's sliders respond."""
+        if preferences_only:
+            self.data["preference"] = {}
+            self.data["corrections"] = 0
+        else:
+            self.data = {"version": 1, "sensitivity": {}, "preference": {}, "runs": 0, "corrections": 0}
         self.save()
+
+    def restore(self, backup):
+        """Put a run's learning_before.json back; the current file is kept as
+        learning.json.bak."""
+        backup = Path(backup)
+        json.loads(backup.read_text())  # refuse a corrupt backup
+        if self.path.exists():
+            shutil.copy2(self.path, self.path.with_suffix(".json.bak"))
+        shutil.copy2(backup, self.path)
+        self.__init__(self.path)
 
     # -- sensitivities ---------------------------------------------------
 
@@ -214,12 +246,23 @@ class Learner:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Show or reset what Match Look has learned.")
-    parser.add_argument("command", choices=["show", "reset"])
+    parser.add_argument("command", choices=["show", "reset", "restore"])
+    parser.add_argument("--preferences", action="store_true", help="reset: forget only learned taste")
+    parser.add_argument("--run", help="restore: the run folder whose learning to undo")
     args = parser.parse_args(argv)
     learner = Learner()
     if args.command == "reset":
-        learner.reset()
-        print(f"Reset {learner.path}")
+        learner.reset(preferences_only=args.preferences)
+        print(f"Reset {'preferences in ' if args.preferences else ''}{learner.path}")
+    elif args.command == "restore":
+        if not args.run:
+            parser.error("restore needs --run")
+        backup = Path(args.run).expanduser() / "learning_before.json"
+        if not backup.exists():
+            print(f"No backup in {args.run} (that run didn't change what was learned)", file=sys.stderr)
+            return 1
+        learner.restore(backup)
+        print(f"Restored {learner.path} from {backup} (previous kept as {learner.path.with_suffix('.json.bak')})")
     else:
         print(json.dumps(learner.summary(), indent=2))
     return 0
