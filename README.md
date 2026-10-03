@@ -11,6 +11,10 @@ Grade one photo, select the rest, and run `/match-look` in Claude Code. Every se
   - It starts from each raw photo's own camera white balance and limits how far white balance can move.
   - Frames dominated by one colour, like foliage or a red wall, aren't mistaken for a colour cast.
 - **A reference exported from another editor** (for example `IMG_1964 copy.jpg`) has its edit baked into the pixels, so there are no settings to copy. Select its unedited original too (`IMG_1964.JPG`; it is found by name, or use `--original`). Match Look fits Lightroom settings that turn the original into the copy: contrast, tone curve, vibrance and saturation, HSL per colour, split toning. It then applies that **same** grade to every photo and solves only each photo's light.
+  - The copy can be a crop: it is lined up with the original automatically, and the two are compared pixel by pixel.
+  - The fit measures how your Lightroom responds to each slider (about 30–40 renders of one photo). The result is kept in `~/.matchlook/grades/` and reused next time; `--refit` learns it again.
+  - Local edits in the copy (masks, brushes) can't be reproduced by global sliders. The report's `grade_fit.delta_e_after` shows how close the fit got.
+  - With a fitted grade, each photo only gets its white balance and exposure solved.
   - Without the original, it falls back to a small per-photo colour match.
   - `--look-strength 0.5` applies half the grade. `--no-look` skips it.
 - **Skin tones (`--skin`):** a skin model built from 14,532 measured skin colours across 8 populations keeps skin consistent and describes each photo's skin in words. See [docs/SKIN_TONES.md](docs/SKIN_TONES.md).
@@ -47,7 +51,7 @@ More docs:
 
 By hand:
 ```
-.venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--look-per-photo] [--no-learning]
+.venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--refit] [--look-per-photo] [--no-learning]
 .venv/bin/python -m engine.workflow nudge --run ~/.matchlook/runs/<time> --photo DSC0042 Exposure2012=+0.2 SaturationAdjustmentBlue=+8
 .venv/bin/python -m engine.workflow nudge --run ... --photo DSC0042 --mask subject Temperature=-10
 .venv/bin/python -m engine.workflow learn        # learn now from edits made since the last run
@@ -59,7 +63,7 @@ Each run writes `report.json`, `contact_sheet_before.jpg` and `contact_sheet.jpg
 ## Layout
 ```
 MatchLook.lrplugin/        Lightroom plugin: file-based bridge (~/.matchlook/bridge)
-engine/                    measure, solver (light), look (colour and contrast), skin model, learning, settings split, workflow, contact sheet
+engine/                    measure, solver (light), look (colour and contrast), align (crop finder), skin model, learning, settings split, workflow, contact sheet
 data/skin_sources.json     measured skin colour data (with sources and licenses)
 tools/build_skin_model.py  builds engine/data/skin_model.json and docs/SKIN_TONES.md from it
 .claude/skills/match-look  the /match-look command for Claude Code

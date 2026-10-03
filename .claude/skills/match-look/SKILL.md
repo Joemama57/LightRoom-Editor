@@ -43,6 +43,8 @@ Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can
 - **A reference exported from another editor** (for example `IMG_1964 copy.jpg`, with its edit baked into the pixels and no Lightroom settings to copy) needs its **unedited original selected too**. The engine finds it by name (`IMG_1964.JPG`). It learns the grade by fitting Lightroom settings that turn the original into the copy, then applies that **same** grade to every photo and solves only each photo's light.
   - If the reference's name doesn't make the original obvious, pass `--original FILE_NAME`.
   - If the summary has a warning that the original wasn't found, tell the user to select the original too and re-run. Without it, only a small, conservative per-photo colour match is possible.
+  - The copy may be a crop of the original: it is lined up automatically. The fit renders the original about 30–40 times (a minute or two) to measure how this Lightroom responds. The result is kept, so later runs with the same reference reuse it instantly. `--refit` learns it again, for example after the user re-edits the copy.
+  - With a learned grade, each photo only gets its white balance and exposure solved. The grade sets the tone.
   - `--look-strength 0.5` applies half of the learned grade. `--no-look` skips it.
 - **Learning is on by default.** Each run:
   - first learns from any edits the user made to the previous run's photos;
@@ -62,7 +64,12 @@ It writes the look and the solved sliders into Lightroom. It takes a "Before Mat
 - for each photo:
   - `start_error`: how far off it was with the look only pasted
   - `final_error`: how far off its light (neutrals and brightness) is after matching (under 2 is a good match)
-- `grade_fit` (only for an exported reference): `original`, `delta_e_before` → `delta_e_after` (how far the original is from the reference before and after fitting; under 3 means the grade was recovered well), and `note` (the biggest parts of the grade, for example "blue sat +20, contrast +15")
+- `grade_fit` (only for an exported reference):
+  - `original`
+  - `aligned`: where the copy sits in the original, with a match score
+  - `delta_e_before` → `delta_e_after`: the pixel difference between the original and the reference, before and after fitting. Under about 3 means the grade was recovered well. Above about 6 usually means the copy has local edits (masks, brushes, sky replacement) that global sliders can't reproduce: tell the user.
+  - `note`: the biggest parts of the grade, for example "blue sat +20, contrast +15"
+  - `cached`: the grade was reused from an earlier run
 - `look_start_error` → `look_final_error` and `look_note` per photo: only when the conservative per-photo colour match ran
   - `flags`
   - `learned_adjustment`: a learned preference that was applied, if any

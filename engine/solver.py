@@ -104,6 +104,10 @@ class Options:
     # the starting point. Matching a dark interior to a bright exterior would
     # otherwise push exposure until the frame blows out.
     tone_limits: tuple = TONE_LIMITS
+    # White balance and exposure only, matched on neutrals and mid-tone
+    # brightness; the tone sliders stay put. Used when a fitted grade already
+    # sets the tone, so content differences don't drive the tone sliders.
+    light_only: bool = False
 
 
 @dataclass
@@ -153,7 +157,7 @@ def _metric_vector(m):
     return np.array([m.b, m.a] + [m.L[k] for k in METRIC_KEYS[2:]])
 
 
-def match_error(ref, target, skin=False, color_only=False):
+def match_error(ref, target, skin=False, color_only=False, light_only=False):
     """One number for how far a render is from the reference (roughly ΔE00 units).
 
     Combines the color difference of the neutral axis (measured at mid-gray) with
@@ -170,6 +174,8 @@ def match_error(ref, target, skin=False, color_only=False):
     if color_only:
         return color
     rv, tv = _metric_vector(r), _metric_vector(t)
+    if light_only:
+        return float(np.hypot(color, tv[4] - rv[4]))
     w = METRIC_WEIGHTS[2:]
     tone = float(np.sqrt(np.sum(w * (tv[2:] - rv[2:]) ** 2) / np.sum(w)))
     return float(np.hypot(color, tone))
@@ -210,7 +216,8 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     target = _metric_vector(ref)
     xs = [_to_internal(h["sliders"], is_raw) for h in history]
     ms = [_metric_vector(h["metrics"]) for h in history]
-    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only) for h in history]
+    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only, light_only=opts.light_only)
+              for h in history]
     best = int(np.argmin(errors))
 
     iterations = len(history) - 1
@@ -246,6 +253,10 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
         active = [0, 1]
         weights[2:] = 0.0
         settled = float(np.hypot(diff[0], diff[1])) <= LIGHT_SETTLED
+    elif opts.light_only:
+        active = LIGHT
+        weights[2:] = 0.0
+        weights[4] = 1.0  # mid-tone brightness only
     else:
         active = list(range(len(CORRECTIVE))) if settled else LIGHT
 

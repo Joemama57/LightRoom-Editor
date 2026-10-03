@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from . import contact_sheet
+from . import align, contact_sheet
 from . import look as look_stage
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
@@ -55,9 +55,13 @@ PER_PHOTO_BAND_RATIO = 2.0
 # Grade fit on the reference's original (same pixels, so it can move further).
 GRADE_LIGHT_ITERATIONS = 8
 GRADE_LOOK_ITERATIONS = 8
-GRADE_LIMIT = 60.0
-GRADE_SPLIT_LIMIT = 40.0
+GRADE_LIMIT = 80.0
+GRADE_SPLIT_LIMIT = 50.0
 GRADE_TOLERANCE = 0.3
+GRADE_FIT_SIZE = 512  # renders of the original during the fit
+GRADE_PAIR_EDGE = 320  # long edge of the pixel-paired comparison
+GRADE_LM_ITERATIONS = 6
+GRADE_PULL = 1e-3  # pull of the look sliders toward no change, per probe step squared
 # Suffixes editors and exports add to a file name: "IMG_1964 copy", "DSC1-Edit", ...
 EXPORT_SUFFIX = re.compile(r"([ _-]+(copy|edit|edited|export|final)( ?\d+)?|[ _-]\d{1,2})+$", re.IGNORECASE)
 
@@ -150,6 +154,8 @@ def run_match(
     look_strength=1.0,
     look_per_photo=False,
     original=None,
+    grades_dir=None,
+    refit=False,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
@@ -165,6 +171,8 @@ def run_match(
     look_per_photo: force the per-photo colour match.
     original: file name of the reference's unedited original (default: found
         by name among the selected photos).
+    grades_dir: where fitted grades are kept for re-use (None: don't keep).
+    refit: fit the grade again even if one was kept for this reference.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -208,7 +216,8 @@ def run_match(
         if source:
             log(f"Reference looks exported from another editor; learning its grade from the original {source['fileName']}")
             creative, grade_fit = fit_grade(bridge, ref, source, creative, ref_corrective, ref_metrics, ref_path,
-                                            out_dir, size, look_strength, warnings, log)
+                                            out_dir, size, look_strength, warnings, log,
+                                            grades_dir=grades_dir, refit=refit)
         else:
             look_per_photo = True
             msg = ("Couldn't find the unedited original of the reference among the selected photos; matching colour "
@@ -216,6 +225,9 @@ def run_match(
             warnings.append(msg)
             log(msg)
     per_photo_look = look and look_per_photo
+    # A fitted grade sets the tone; each photo then only needs its white
+    # balance and exposure, matched on neutrals and mid-tones.
+    light_only = grade_fit is not None and not color_only
 
     state = {}
     for t in targets:
@@ -236,7 +248,7 @@ def run_match(
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
             "wb_from_camera": wb_from_camera,
             "options": Options(prior=prior, skin=skin, color_only=color_only,
-                               wb_limits=wb_limits(t_raw, wb_from_camera)),
+                               wb_limits=wb_limits(t_raw, wb_from_camera), light_only=light_only),
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
         }
@@ -289,7 +301,8 @@ def run_match(
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
-        errors = [match_error(ref_metrics, h["metrics"], skin=o.skin, color_only=o.color_only) for h in s["history"]]
+        errors = [match_error(ref_metrics, h["metrics"], skin=o.skin, color_only=o.color_only,
+                              light_only=o.light_only) for h in s["history"]]
         best = min(range(len(errors)), key=errors.__getitem__)
         matched = blend(s["start"], p.sliders, strength, s["is_raw"])
         s["light"] = light_bucket(p.sliders, s["is_raw"])
@@ -319,7 +332,8 @@ def run_match(
 
     for s in state.values():
         o = s["options"]
-        s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only)
+        s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only,
+                                       light_only=o.light_only)
         s["flags"] = flags_for(s["final_metrics"], s["proposal"], tolerance)
         # Only worth a look when the limit kept it from matching.
         if s["final_error"] >= tolerance and not o.color_only and at_tone_limit(s["start"], s["proposal"].sliders, s["is_raw"], o.tone_limits):
@@ -343,7 +357,8 @@ def run_match(
         "tolerance": tolerance,
         "size": size,
         "options": {"skin": skin, "color_only": color_only, "learning": learner is not None,
-                    "look": look, "look_strength": look_strength, "look_per_photo": per_photo_look},
+                    "look": look, "look_strength": look_strength, "look_per_photo": per_photo_look,
+                    "light_only": light_only},
         "grade_fit": grade_fit,
         "baked_reference": bool(baked),
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
@@ -430,9 +445,10 @@ def pixel_delta_e(path_a, path_b, max_aspect_diff=0.02):
     return float(np.mean(delta_e_2000(la, lb)))
 
 
-def fit_grade(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_path, out_dir, size,
-              look_strength, warnings, log):
-    """Recover the edit baked into an exported reference from its unedited original.
+def _fit_grade_stats(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_path, out_dir, size,
+                     look_strength, warnings, log):
+    """Fallback grade fit when the copy can't be lined up with its original:
+    compares whole-image statistics instead of pixels.
 
     Same pixels on both sides, so any difference is the grade: first the light
     (white balance, exposure, tone) as for any photo, then the look sliders
@@ -496,7 +512,193 @@ def fit_grade(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_
         "note": look_stage.describe(offsets) or None,
         "light": light,
         "preview": str(fitted),
+        "aligned": None,
     }
+
+
+# Variables of the paired grade fit: (name, probe step, low, high). Look
+# sliders are offsets on the reference's own creative values.
+_GRADE_LOOK_VARS = (
+    [(k, 20.0, -GRADE_LIMIT, GRADE_LIMIT) for k in look_stage.TONE_KEYS + look_stage.SAT_KEYS]
+)
+_SPLIT_VARS = [(k, 15.0, -GRADE_SPLIT_LIMIT, GRADE_SPLIT_LIMIT) for k in look_stage.SPLIT_VARS]
+
+
+def _grade_variables(o_raw, bands, split):
+    light = [("Temperature", 400.0, 2000.0, 50000.0) if o_raw else ("Temperature", 10.0, -100.0, 100.0),
+             ("Tint", 10.0, -150.0, 150.0), ("Exposure2012", 0.3, -5.0, 5.0)]
+    hsl = [(f"{kind}Adjustment{band}", 20.0, -GRADE_LIMIT, GRADE_LIMIT)
+           for band in bands for kind in ("Hue", "Saturation", "Luminance")]
+    return light + _GRADE_LOOK_VARS + hsl + (_SPLIT_VARS if split else [])
+
+
+def _cap_split(x, names):
+    x = x.copy()
+    for name in ("shadow", "highlight"):
+        if f"{name}_a" in names:
+            i, j = names.index(f"{name}_a"), names.index(f"{name}_b")
+            sat = np.hypot(x[i], x[j])
+            if sat > GRADE_SPLIT_LIMIT:
+                x[[i, j]] *= GRADE_SPLIT_LIMIT / sat
+    return x
+
+
+def _grade_key(ref, original):
+    import hashlib
+    blob = json.dumps([ref.get("fileName"), ref.get("settings"), original.get("fileName"),
+                       original.get("captureTime")], sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()
+
+
+def fit_grade(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_path, out_dir, size,
+              look_strength, warnings, log, grades_dir=None, refit=False):
+    """Recover the edit baked into an exported reference from its unedited original.
+
+    1. Line up the copy with the original (it is often a crop): engine/align.py.
+    2. Compare them pixel by pixel, grouped by lightness zone and colour family
+       (look.paired_residual): same pixels on both sides, so any difference is
+       the grade, never content.
+    3. Measure how this Lightroom actually responds: one render per slider.
+    4. Solve for the sliders (Levenberg-Marquardt), refining the measured
+       response after every render.
+    Returns the creative settings to copy to every photo, and a summary.
+    Falls back to whole-image statistics when the copy can't be lined up.
+    """
+    cache = Path(grades_dir) / f"{_stem(ref.get('fileName')) or 'reference'}.json" if grades_dir else None
+    key = _grade_key(ref, original)
+    if cache and cache.exists() and not refit:
+        try:
+            saved = json.loads(cache.read_text())
+            if saved.get("key") == key:
+                offsets = {k: float(round(v * look_strength)) for k, v in saved["offsets"].items()}
+                look_settings = look_stage.to_settings(offsets, creative, GRADE_SPLIT_LIMIT)
+                log(f"Using the grade learned earlier from {original['fileName']} (--refit to learn it again)")
+                return {**creative, **look_settings}, dict(saved["info"], look_settings=look_settings, cached=True)
+        except (OSError, ValueError, KeyError):
+            pass
+
+    fit_dir = out_dir / "grade_fit"
+    fit_dir.mkdir(exist_ok=True)
+    oid, o_raw = original["id"], is_raw(original)
+    start, _ = starting_corrective(ref_corrective, is_raw(ref), o_raw, original.get("settings"))
+    renders = [0]
+
+    def render(tag, settings):
+        _apply(bridge, [{"id": oid, "settings": settings}], warnings, log)
+        path = fit_dir / f"{tag}.jpg"
+        bridge.render([{"id": oid, "path": str(path)}], size=GRADE_FIT_SIZE)
+        renders[0] += 1
+        return path
+
+    base_path = render("base", {**creative, **_corrective_settings(start)})
+    ref_img, base_img = load_image(ref_path), load_image(base_path)
+    found = align.locate(base_img, ref_img)
+    if found is None:
+        ra, rb = ref_img.shape[1] / ref_img.shape[0], base_img.shape[1] / base_img.shape[0]
+        if abs(ra - rb) / ra > 0.02:
+            log("Grade fit: couldn't line up the reference with its original; comparing whole images instead")
+            return _fit_grade_stats(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_path, out_dir,
+                                    size, look_strength, warnings, log)
+        found = {"box": [0.0, 0.0, 1.0, 1.0], "score": None}
+    box = found["box"]
+    scale = GRADE_PAIR_EDGE / max(ref_img.shape[:2])
+    pair_size = (max(8, int(ref_img.shape[1] * scale)), max(8, int(ref_img.shape[0] * scale)))
+    ref_lab = srgb_to_lab(align.crop(ref_img, [0, 0, 1, 1], pair_size).reshape(-1, 3))
+
+    def lab_of(path):
+        return srgb_to_lab(align.crop(load_image(path), box, pair_size).reshape(-1, 3))
+
+    base_rgb = align.crop(base_img, box, pair_size).reshape(-1, 3)
+    labels, kept, fractions = look_stage.paired_classes(base_rgb, srgb_to_lab(base_rgb))
+    bands = [b for b, f in look_stage.band_fractions(labels, kept, fractions).items() if f >= 0.01]
+    variables = _grade_variables(o_raw, bands, split=not look_stage.has_split_toning(creative))
+    names = [v[0] for v in variables]
+    steps = np.array([v[1] for v in variables])
+    lo, hi = np.array([v[2] for v in variables]), np.array([v[3] for v in variables])
+    n_light = 3
+
+    def settings_for(x):
+        corr = dict(start, **{names[i]: float(x[i]) for i in range(n_light)})
+        offsets = {names[i]: float(x[i]) for i in range(n_light, len(names))}
+        return {**creative, **_corrective_settings(clamp(corr, o_raw)),
+                **look_stage.to_settings(offsets, creative, GRADE_SPLIT_LIMIT)}
+
+    def residual(path):
+        return look_stage.paired_residual(lab_of(path), ref_lab, labels, kept, fractions)
+
+    def error(r):
+        return look_stage.paired_error(r, fractions)
+
+    x = np.array([float(start.get(n, 0.0)) if i < n_light else 0.0 for i, n in enumerate(names)])
+    r = residual(base_path)
+    delta_before = _paired_delta_e(lab_of(base_path), ref_lab)
+    log(f"Grade fit: lined up with {original['fileName']}"
+        + (f" (match {found['score']:.2f})" if found["score"] is not None else "")
+        + f"; measuring how {len(names)} sliders respond")
+
+    # Measured response: one probe render per slider.
+    J = np.zeros((len(r), len(names)))
+    for j in range(len(names)):
+        step = steps[j] if x[j] + steps[j] <= hi[j] else -steps[j]
+        probe = x.copy()
+        probe[j] += step
+        J[:, j] = (residual(render(f"probe_{names[j]}", settings_for(probe))) - r) / step
+
+    # Levenberg-Marquardt in probe-step units, with a small pull toward no change.
+    best_x, best_r, err = x, r, error(r)
+    lam = 1e-2
+    pull = np.array([0.0] * n_light + [GRADE_PULL] * (len(names) - n_light))
+    for it in range(GRADE_LM_ITERATIONS):
+        Ju = J * steps
+        A = Ju.T @ Ju
+        u = (best_x - np.array([x[i] if i < n_light else 0.0 for i in range(len(names))])) / steps
+        lhs = A + lam * np.diag(np.diag(A) + 1e-9) + np.diag(pull)
+        du = np.linalg.solve(lhs, -(Ju.T @ best_r) - pull * u)
+        cand = _cap_split(np.clip(best_x + du * steps, lo, hi), names)
+        if np.abs(cand - best_x).max() < 1e-6:
+            break
+        cr = residual(render(f"fit_{it}", settings_for(cand)))
+        dx = cand - best_x
+        J = J + np.outer(cr - best_r - J @ dx, dx) / (dx @ dx)  # Broyden: refine the measured response
+        cerr = error(cr)
+        if cerr < err:
+            improvement = (err - cerr) / err
+            best_x, best_r, err = cand, cr, cerr
+            lam = max(lam / 3, 1e-4)
+            if improvement < 0.01:
+                break
+        else:
+            lam *= 4
+
+    offsets = {names[i]: float(round(best_x[i])) for i in range(n_light, len(names))}
+    scaled = {k: float(round(v * look_strength)) for k, v in offsets.items()}
+    look_settings = look_stage.to_settings(scaled, creative, GRADE_SPLIT_LIMIT)
+    final_x = best_x.copy()
+    for i in range(n_light, len(names)):
+        final_x[i] = scaled[names[i]]
+    fitted = render("fitted", settings_for(final_x))
+    delta_after = _paired_delta_e(lab_of(fitted), ref_lab)
+    log(f"Grade fit: {delta_before:.1f} -> {delta_after:.1f} difference from the reference ({renders[0]} renders)")
+    light = clamp(dict(start, **{names[i]: float(best_x[i]) for i in range(n_light)}), o_raw)
+    info = {
+        "original": original["fileName"],
+        "aligned": found,
+        "delta_e_before": round(delta_before, 2),
+        "delta_e_after": round(delta_after, 2),
+        "look_error": round(err, 2),
+        "note": look_stage.describe(scaled) or None,
+        "light": light,
+        "renders": renders[0],
+        "preview": str(fitted),
+    }
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"key": key, "offsets": offsets, "info": info}, indent=1))
+    return {**creative, **look_settings}, dict(info, look_settings=look_settings)
+
+
+def _paired_delta_e(lab_a, lab_b):
+    return float(np.mean(delta_e_2000(lab_a, lab_b)))
 
 
 def _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint):
@@ -688,7 +890,8 @@ def _rerender(bridge, run_dir, report, p, tag):
     opts = report.get("options", {})
     p["preview"] = str(path)
     p["final_error"] = round(match_error(ref_metrics, metrics, skin=opts.get("skin", False),
-                                         color_only=opts.get("color_only", False)), 2)
+                                         color_only=opts.get("color_only", False),
+                                         light_only=opts.get("light_only", False)), 2)
     p["skin"] = _skin(metrics)
     ref_skin = report["reference"].get("skin")
     p["skin_vs_reference"] = skin_model.compare(ref_skin, p["skin"]) if ref_skin and p["skin"] else None
@@ -848,6 +1051,7 @@ def main(argv=None):
     m.add_argument("--look-per-photo", action="store_true",
                    help="also nudge each photo's colours toward the reference's (small, per photo)")
     m.add_argument("--original", help="file name of the reference's unedited original, if not found by name")
+    m.add_argument("--refit", action="store_true", help="learn an exported reference's grade again")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -879,7 +1083,8 @@ def main(argv=None):
                                skin=args.skin, color_only=args.color_only, learner=learner,
                                runs_dir=RUNS_DIR if not args.out else None, log=log,
                                look=not args.no_look, look_strength=args.look_strength,
-                               look_per_photo=args.look_per_photo, original=args.original)
+                               look_per_photo=args.look_per_photo, original=args.original,
+                               grades_dir=RUNS_DIR.parent / "grades", refit=args.refit)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             p = run_nudge(bridge, args.run, args.photo, parse_changes(args.changes, allow_mask=bool(args.mask)),

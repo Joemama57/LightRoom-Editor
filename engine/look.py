@@ -439,3 +439,47 @@ def describe(offsets):
     split = [n for n in ("shadow", "highlight") if np.hypot(offsets.get(f"{n}_a", 0), offsets.get(f"{n}_b", 0)) >= 3]
     notes += [f"{n} tint" for n in split]
     return ", ".join(notes[:5])
+
+
+# -- pixel-paired comparison (grade fit on an original and its edited copy) ----
+
+PAIR_ZONES = 5  # lightness zones of 20 L* each
+PAIR_NEUTRAL_CHROMA = 8.0
+PAIR_MIN_FRACTION = 0.003
+
+
+def paired_classes(rgb, lab):
+    """Group the pixels of the original's render into lightness zone x colour
+    family (neutral or one of the 8 HSL bands). Returns (labels, kept, fractions)."""
+    L, c = lab[:, 0], np.hypot(lab[:, 1], lab[:, 2])
+    zone = np.clip((L / (100 / PAIR_ZONES)).astype(int), 0, PAIR_ZONES - 1)
+    family = np.where(c < PAIR_NEUTRAL_CHROMA, len(BANDS), band_weights(hsv_hue(rgb)).argmax(axis=1))
+    labels = family * PAIR_ZONES + zone
+    counts = np.bincount(labels, minlength=(len(BANDS) + 1) * PAIR_ZONES)
+    kept = [k for k in range(len(counts)) if counts[k] >= PAIR_MIN_FRACTION * len(labels)]
+    return labels, kept, {k: counts[k] / len(labels) for k in kept}
+
+
+def band_fractions(labels, kept, fractions):
+    """Share of the picture in each HSL band (chromatic classes only)."""
+    out = {b: 0.0 for b in BANDS}
+    for k in kept:
+        family = k // PAIR_ZONES
+        if family < len(BANDS):
+            out[BANDS[family]] += fractions[k]
+    return out
+
+
+def paired_residual(candidate_lab, ref_lab, labels, kept, fractions):
+    """Per class, mean Lab of the candidate minus the reference over the same
+    pixels, scaled so that |r|^2 is the class-size-weighted mean squared error."""
+    r = []
+    for k in kept:
+        sel = labels == k
+        d = candidate_lab[sel].mean(axis=0) - ref_lab[sel].mean(axis=0)
+        r.extend(np.sqrt(fractions[k]) * d)
+    return np.array(r)
+
+
+def paired_error(residual, fractions):
+    return float(np.sqrt((residual ** 2).sum() / max(sum(fractions.values()), 1e-9)))

@@ -3,6 +3,8 @@ import pytest
 
 from engine import look
 from engine.colorspace import delta_e_2000, srgb_to_lab, srgb_to_linear
+from PIL import Image
+
 from engine.workflow import find_original, run_match
 from tests.fake_lightroom import FakeLightroom
 from tests.simulator import capture, make_scene, render
@@ -157,3 +159,63 @@ def test_contact_sheet_notes_stay_short_and_skip_skin_unless_asked():
     assert "skin" not in _tiles(report, "preview")[1]["subtitle"]
     report["options"]["skin"] = True
     assert "skin greener" in _tiles(report, "preview")[1]["subtitle"]
+
+
+STRONG_LOOK = dict(BAKED_LOOK, SaturationAdjustmentOrange=-30, LuminanceAdjustmentYellow=-20, ParametricShadows=-25,
+                   SplitToningHighlightHue=50, SplitToningHighlightSaturation=15)
+
+
+def cropped_pair(look_settings=STRONG_LOOK):
+    """The original, and an exported copy that is a graded 4:5 crop of it, resized."""
+    original = capture(sky_scene(0, size=160), 5500)
+    graded = render(original, look_settings)
+    H, W = graded.shape[:2]
+    w = int(0.7 * W)
+    crop = graded[int(0.05 * H):int(0.05 * H) + int(w / 0.8), int(0.2 * W):int(0.2 * W) + w]
+    crop = np.asarray(Image.fromarray((crop * 255).round().astype(np.uint8)).resize((96, 120), Image.LANCZOS),
+                      float) / 255
+    return original, srgb_to_linear(crop)
+
+
+@pytest.fixture
+def cropped_set():
+    original, copy = cropped_pair()
+    return FakeLightroom({"ref": photo(copy, "IMG_1964 copy.jpg"), "orig": photo(original, "IMG_1964.JPG"),
+                          **scenes()}, active="ref")
+
+
+def test_grade_fit_through_a_crop(cropped_set, tmp_path):
+    report = run_match(cropped_set, tmp_path, log=quiet)
+    fit = report["grade_fit"]
+    assert fit["aligned"]["score"] > 0.8
+    assert fit["delta_e_after"] < fit["delta_e_before"] * 0.65 and fit["look_error"] < 0.6, fit
+    g = fit["look_settings"]
+    assert g["SaturationAdjustmentOrange"] == pytest.approx(-30, abs=10)
+    assert g["LuminanceAdjustmentYellow"] == pytest.approx(-20, abs=10)
+    # The grade does to another scene what the real edit would have done.
+    raw = capture(sky_scene(3)[6:, :], 5500)
+    truth = srgb_to_lab(render(raw, STRONG_LOOK).reshape(-1, 3))
+    fitted = delta_e_2000(truth, srgb_to_lab(render(raw, g).reshape(-1, 3))).mean()
+    unedited = delta_e_2000(truth, srgb_to_lab(render(raw, {}).reshape(-1, 3))).mean()
+    assert fitted < unedited / 2, (fitted, unedited)
+
+
+def test_with_a_grade_each_photo_only_gets_white_balance_and_exposure(cropped_set, tmp_path):
+    report = run_match(cropped_set, tmp_path, log=quiet)
+    assert report["options"]["light_only"]
+    for p in report["photos"]:
+        for key in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"):
+            assert p["final"][key] == 0.0  # the reference's own values
+        assert p["final_error"] < 2.0 and "not_converged" not in p["flags"], p
+
+
+def test_fitted_grade_is_kept_and_reused(cropped_set, tmp_path):
+    grades = tmp_path / "grades"
+    first = run_match(cropped_set, tmp_path / "a", grades_dir=grades, log=quiet)
+    renders = cropped_set.renders
+    second = run_match(cropped_set, tmp_path / "b", grades_dir=grades, log=quiet)
+    assert second["grade_fit"]["cached"]
+    assert second["grade_fit"]["look_settings"] == first["grade_fit"]["look_settings"]
+    assert cropped_set.renders - renders < first["grade_fit"]["renders"]  # no fit renders the second time
+    third = run_match(cropped_set, tmp_path / "c", grades_dir=grades, refit=True, log=quiet)
+    assert not third["grade_fit"].get("cached")
