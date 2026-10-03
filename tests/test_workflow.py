@@ -6,6 +6,7 @@ import pytest
 from PIL import Image
 
 from engine.settings import split, starting_corrective
+from engine import workflow
 from engine.workflow import parse_changes, run_match, run_nudge
 from tests.fake_lightroom import FakeLightroom
 from tests.simulator import capture, make_scene
@@ -960,3 +961,60 @@ def test_raw_tint_is_written_in_whole_numbers():
     from engine.solver import clamp
     assert clamp({"Temperature": 3889, "Tint": 7.6, "Exposure2012": 0}, is_raw=True)["Tint"] == 8.0
     assert clamp({"Temperature": 10, "Tint": 7.6, "Exposure2012": 0}, is_raw=False)["Tint"] == 7.6
+
+
+def _ceremony(frames, backdrop=None, tone=None):
+    """A reference and frames from its shoot, under the same 3000 K stage light but
+    {id: stops} brighter or darker (manual exposure: toward the lights, or the crowd).
+    backdrop: (share of the frame, linear grey) for a light curtain behind the couple."""
+    ref = photo(capture(make_scene(seed=0), 3000), "DSC1078.ARW",
+                settings={**REF_SETTINGS, **(tone or {}), "Temperature": 3000})
+    ref["captureTime"] = 0.0
+    photos = {"ref": ref}
+    for n, (pid, stops) in enumerate(frames.items()):
+        scene = make_scene(seed=n + 1)[4:, 2:].copy()
+        if backdrop:
+            scene[:int(scene.shape[0] * backdrop[0])] = [backdrop[1], backdrop[1], backdrop[1] * 1.03]
+        p = photo(capture(scene, 3000, 0, stops), f"DSC10{n + 81}.ARW",
+                  settings={"WhiteBalance": "As Shot", "Temperature": 3000, "Tint": 0})
+        p["captureTime"] = 60.0 * (n + 1)
+        photos[pid] = p
+    return FakeLightroom(photos, active="ref")
+
+
+def test_frames_of_one_shoot_are_evened_toward_the_references_brightness(tmp_path):
+    frames = {"lights": 0.8, "crowd": -0.8, "candles": -3.0}
+    held = {p["id"]: p for p in run_match(_ceremony(frames), tmp_path / "off", log=quiet)["photos"]}
+    report = run_match(_ceremony(frames), tmp_path / "on", even_shoot_tone=True, log=quiet)
+    ref_p50 = report["reference"]["metrics"]["L"]["p50"]
+    for p in report["photos"]:
+        first = p["trace"][0]["p50"]
+        if p["id"] == "candles":  # another kind of scene: left as it was
+            assert "tone_from_shoot" not in p["flags"] and p["final"] == held["candles"]["final"]
+            continue
+        st = p["shoot_tone"]
+        assert "tone_from_shoot" in p["flags"] and "tone_from_shoot" not in held[p["id"]]["flags"]
+        assert abs(st["after"]["p50"] - ref_p50) < abs(st["before"]["p50"] - ref_p50)
+        # Part of the gap is kept as content: a brighter frame stays a little brighter.
+        assert abs(st["after"]["p50"] - (ref_p50 + workflow.SHOOT_TONE_KEEP * (first - ref_p50))) < 3.0
+        assert abs(p["final"]["Exposure2012"]) <= 0.6
+    assert next(p for p in report["photos"] if p["id"] == "lights")["final"]["Exposure2012"] < -0.3
+    assert next(p for p in report["photos"] if p["id"] == "crowd")["final"]["Exposure2012"] > 0.3
+
+
+def test_a_hazy_bright_frame_gets_less_shadow_lift(tmp_path):
+    tone = {"Exposure2012": 0.65, "Shadows2012": 66, "Highlights2012": -61, "Blacks2012": -60}
+    lr = lambda: _ceremony({"couple": 0.6}, backdrop=(0.7, 0.2), tone=tone)
+    (held,) = run_match(lr(), tmp_path / "off", log=quiet)["photos"]
+    (p,) = run_match(lr(), tmp_path / "on", even_shoot_tone=True, log=quiet)["photos"]
+    assert held["final"]["Shadows2012"] == 66 and held.get("shoot_tone") is None
+    assert p["final"]["Shadows2012"] == 33 and p["final"]["Exposure2012"] < held["final"]["Exposure2012"]
+    assert p["shoot_tone"]["after"]["p50"] < p["shoot_tone"]["before"]["p50"]
+
+
+def test_frames_whose_faces_already_match_keep_their_brightness(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "_face_gap", lambda ref, m, s: 0.0)  # faces as bright as the reference's
+    frames = {"lights": 0.8, "crowd": -0.8}
+    held = {p["id"]: p["final"] for p in run_match(_ceremony(frames), tmp_path / "off", log=quiet)["photos"]}
+    for p in run_match(_ceremony(frames), tmp_path / "on", even_shoot_tone=True, log=quiet)["photos"]:
+        assert p["final"] == held[p["id"]] and p.get("shoot_tone") is None

@@ -451,6 +451,7 @@ def main(argv=None):
     b.add_argument("runs", nargs="+")
     for cmd in (b, sub.choices["rerun"]):
         cmd.add_argument("--hold-shoot-wb", action="store_true", help="try the shoot white-balance hold")
+        cmd.add_argument("--even-shoot-tone", action="store_true", help="try evening the shoot's brightness")
         _subject_args(cmd)
     args = parser.parse_args(argv)
     try:
@@ -460,7 +461,7 @@ def main(argv=None):
             run_dir = Path(args.run)
             before = load_report(run_dir)
             report, _ = rerun(run_dir, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
-                              **_subject_options(args))
+                              even_shoot_tone=args.even_shoot_tone, **_subject_options(args))
             old = {p["fileName"]: p for p in before["photos"]}
             rows = [{"photo": p["fileName"],
                      "as_run": {k: old[p["fileName"]]["final"][k] for k in ("Temperature", "Tint", "Exposure2012")},
@@ -472,7 +473,7 @@ def main(argv=None):
             print(json.dumps(save_answers(Bridge(), Path(args.run)), indent=1))
         else:
             print(json.dumps(bench(args.runs, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
-                                   **_subject_options(args)), indent=1))
+                                   even_shoot_tone=args.even_shoot_tone, **_subject_options(args)), indent=1))
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
