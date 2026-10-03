@@ -870,3 +870,93 @@ def test_calming_colour_stops_before_it_drains_the_faces():
     # When no step is safe, the reference's own colour stays.
     history[1] = _calm_step({"Vibrance": -7.0, "Saturation": -7.0}, 28.0, 16.0)
     assert wf._skin_safe_calm(s, full, ref_chroma, 25.0, quiet) == {"Vibrance": 0.0, "Saturation": 0.0}
+
+
+def _magenta_faces(target_skin):
+    """A reference and a frame from the same light whose faces are redder (DSC01318):
+    the neutrals already match, so white balance can't fix the faces."""
+    rng = np.random.default_rng(3)
+
+    def scene(skin):
+        s = make_scene(seed=0, size=256).copy()
+        s[30:110, 130:240] = np.array(skin) * (1 + 0.06 * rng.standard_normal((80, 110, 1)))
+        return s
+
+    ref = photo(capture(scene([0.50, 0.33, 0.22]), 5500), "DSC01303.ARW", settings=dict(REF_SETTINGS))
+    t = photo(capture(scene(target_skin), 5500), "DSC01318.ARW")
+    return FakeLightroom({"ref": ref, "t": t}, active="ref")
+
+
+@pytest.fixture
+def sim_hue(monkeypatch):
+    import engine.workflow as wf
+    # The simulator's Orange hue moves skin about a quarter as far as Lightroom's is assumed to.
+    monkeypatch.setattr(wf, "SKIN_HUE_GAIN", 4.0)
+    monkeypatch.setattr(wf, "SKIN_HUE_STEP", 30.0)
+    monkeypatch.setattr(wf, "SKIN_HUE_LIMIT", 40.0)
+
+
+def _hue(p):
+    return p["skin"]["hue"]
+
+
+def test_redder_faces_are_turned_toward_the_references_skin_hue(tmp_path, sim_hue):
+    off = run_match(_magenta_faces([0.50, 0.29, 0.22]), tmp_path / "off", skin=True, log=quiet)["photos"][0]
+    lr = _magenta_faces([0.50, 0.29, 0.22])
+    report = run_match(lr, tmp_path / "on", skin=True, skin_hue=True, log=quiet)
+    (p,) = report["photos"]
+    ref_hue = report["reference"]["skin"]["hue"]
+    assert "skin_hue_from_faces" in p["flags"] and "skin_hue_from_faces" not in off["flags"]
+    assert abs(ref_hue - _hue(p)) < abs(ref_hue - _hue(off)) - 2.0
+    assert p["final"]["Temperature"] == off["final"]["Temperature"] and p["final"]["Tint"] == off["final"]["Tint"]
+    assert lr.photos["t"]["settings"]["HueAdjustmentOrange"] == p["look_settings"]["HueAdjustmentOrange"] > 0
+    assert p["skin_hue"]["after"] == pytest.approx(_hue(p), abs=0.1)
+
+
+def test_faces_that_already_match_keep_the_references_orange_hue(tmp_path, sim_hue):
+    lr = _magenta_faces([0.50, 0.33, 0.22])
+    (p,) = run_match(lr, tmp_path, skin=True, skin_hue=True, log=quiet)["photos"]
+    assert "skin_hue_from_faces" not in p["flags"] and p["skin_hue"] is None
+    assert "HueAdjustmentOrange" not in lr.photos["t"]["settings"]
+
+
+def test_a_hue_step_that_does_not_help_is_put_back(tmp_path, sim_hue):
+    lr = _magenta_faces([0.50, 0.29, 0.22])
+    lr.rejected_keys = {"HueAdjustmentOrange"}  # this "Lightroom" ignores it: the faces can't get closer
+    (p,) = run_match(lr, tmp_path, skin=True, skin_hue=True, log=quiet)["photos"]
+    assert "skin_hue_from_faces" not in p["flags"] and p["skin_hue"] is None
+
+
+def test_the_solve_stops_instead_of_rendering_the_same_sliders_again(tmp_path):
+    # Held white balance and a colour gap that is content (sand): earlier, the same
+    # sliders were rendered again and again until the pass limit.
+    report = run_match(_resynced_beach(1800.0), tmp_path, hold_shoot_wb=True, log=quiet)
+    (p,) = report["photos"]
+    rows = [tuple(t[k] for k in ("Temperature", "Tint", "Exposure2012")) for t in p["trace"]]
+    assert len(rows) == len(set(rows)) and len(rows) < 7
+
+
+def test_candles_and_flowers_are_not_matched_as_faces(tmp_path):
+    # DSC01250: a night arch of candles and flowers, no people. Its "skin" is far more
+    # colourful than the reference's faces, so it mustn't steer the white balance.
+    lr = _magenta_faces([0.60, 0.20, 0.05])
+    (p,) = run_match(lr, tmp_path, skin=True, log=quiet)["photos"]
+    assert "skin_not_matched" in p["flags"]
+    (q,) = run_match(_magenta_faces([0.50, 0.33, 0.22]), tmp_path / "faces", skin=True, log=quiet)["photos"]
+    assert "skin_not_matched" not in q["flags"]
+
+
+def test_big_runs_also_get_sheets_of_two_photos_next_to_the_reference(lightroom, tmp_path):
+    report = run_match(lightroom, tmp_path, log=quiet)
+    assert len(report["photos"]) == 3
+    sheets = sorted(p.name for p in tmp_path.glob("contact_sheet_[0-9]*.jpg"))
+    assert sheets == ["contact_sheet_1.jpg", "contact_sheet_2.jpg"]
+    with Image.open(tmp_path / "contact_sheet_1.jpg") as im, Image.open(tmp_path / "contact_sheet.jpg") as big:
+        assert im.width > big.width * 0.9 and im.height < big.height * 2  # three big tiles in one row
+    assert (tmp_path / "contact_sheet.jpg").exists() and (tmp_path / "contact_sheet_before.jpg").exists()
+
+
+def test_raw_tint_is_written_in_whole_numbers():
+    from engine.solver import clamp
+    assert clamp({"Temperature": 3889, "Tint": 7.6, "Exposure2012": 0}, is_raw=True)["Tint"] == 8.0
+    assert clamp({"Temperature": 10, "Tint": 7.6, "Exposure2012": 0}, is_raw=False)["Tint"] == 7.6

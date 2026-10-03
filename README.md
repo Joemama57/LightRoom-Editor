@@ -58,7 +58,7 @@ More docs:
 
 By hand:
 ```
-.venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--refit] [--look-per-photo] [--no-learning]
+.venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--refit] [--look-per-photo] [--no-learning] [--skin-hue] [--hold-shoot-wb]
 .venv/bin/python -m engine.workflow nudge --run ~/.matchlook/runs/<time> --photo DSC0042 Exposure2012=+0.2 SaturationAdjustmentBlue=+8
 .venv/bin/python -m engine.workflow nudge --run ... --photo DSC0042 --mask subject Temperature=-10
 .venv/bin/python -m engine.workflow learn [--skip] # learn now from edits made since the last run (or skip it)

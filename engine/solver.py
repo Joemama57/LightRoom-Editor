@@ -145,6 +145,9 @@ def _to_sliders(x, is_raw):
     out["Exposure2012"] = round(out["Exposure2012"], 2)
     for key in ("Tint", "Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"):
         out[key] = round(out[key], 1)
+    if is_raw:
+        # Lightroom keeps a raw's Tint in whole numbers (it answered Tint 7.6 with 8).
+        out["Tint"] = float(round(out["Tint"]))
     return out
 
 
@@ -261,9 +264,21 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
             iterations=iterations,
         )
 
+    def settled_on(x_next):
+        # The next render would repeat one already made (a slider held at its
+        # limit, or a step that bounces between two values): nothing new to learn.
+        nxt = _to_sliders(x_next, is_raw)
+        return any(_to_sliders(x, is_raw) == nxt for x in xs)
+
+    def finish():
+        return Proposal(sliders=_to_sliders(xs[best], is_raw), done=True, residual=errors[-1],
+                        best_residual=errors[best], iterations=iterations)
+
     # If the last step made things worse, back off halfway toward the best render.
     if len(errors) > 1 and errors[-1] > errors[best] * 1.05:
         x_next = (xs[-1] + xs[best]) / 2
+        if settled_on(x_next):
+            return finish()
         return Proposal(
             sliders=_to_sliders(x_next, is_raw),
             done=False,
@@ -317,6 +332,8 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     x_next = (u_cur + du) * SLIDER_SCALE
     x_next = _limit_white_balance(x_next, xs[0], opts.wb_limits)
     x_next = _limit_tone(x_next, xs[0], opts.tone_limits)
+    if settled_on(x_next):
+        return finish()
 
     return Proposal(
         sliders=_to_sliders(x_next, is_raw),

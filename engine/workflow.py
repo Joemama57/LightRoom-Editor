@@ -52,6 +52,8 @@ LOOK_LIGHT_TOLERANCE = 0.5  # fraction of the light tolerance to aim for before 
 LOOK_ITERATIONS = 4
 PER_PHOTO_LOOK_LIMIT = 12.0
 SUBTITLE_CHARS = 58  # what fits under one contact-sheet tile
+SHEET_GROUP = 2  # photos per extra contact sheet, each next to the reference
+SHEET_GROUP_TILE = 600  # pixels per photo on those sheets (the big sheet uses 360)
 PER_PHOTO_BAND_RATIO = 2.0
 STYLE_ITERATIONS = 6  # passes of the shared grade read from an outside reference
 # Photos from the reference's own shoot (same camera and file type, taken within
@@ -106,6 +108,11 @@ CONTENT_KEEP = 0.5
 SKIN_ANCHOR_EV = 0.5
 SKIN_ANCHOR_MIN_FRACTION = 0.03
 SKIN_ANCHOR_CHROMA = 10.0
+# A first render whose skin-coloured pixels are this much more (or less) colourful
+# than the reference's faces isn't matched on skin at all: candles and flowers at
+# night read 32 against 15 (DSC01250). Portraits with gold jewellery reached 13
+# (DSC00130), so the line sits above that.
+SKIN_FALSE_CHROMA = 15.0
 # In a frame of coloured saris and gold backdrops the "neutral" pixels are a guess,
 # so after the solve the faces can still be off the reference's in colour (the report
 # says "more magenta", "bluer / cooler"). With --skin, a photo whose skin (a*, b*) is
@@ -118,6 +125,20 @@ SKIN_COLOR_TINT = 10.0
 SKIN_COLOR_PASSES = 2
 SKIN_COLOR_DAMPING = 0.8
 SKIN_COLOR_NEUTRAL_SLACK = 1.5
+# Face hue (--skin --skin-hue, after the face-colour pass): faces redder / more
+# magenta than the reference's while the rest of the frame matches can't be
+# fixed with white balance, which moves everything (DSC01318, batch 2: skin hue
+# 59.9° against 65.6°; Tint −2.9 took skin a* from 12.5 to 12.1 but turned the
+# neutrals greener than the reference's). Orange hue moves skin toward yellow
+# and leaves greys alone. Only faces more than SKIN_HUE_DEADBAND degrees (CIELAB
+# hue) redder than the reference's are touched, each step is re-rendered and
+# kept only if the faces got closer and the neutrals didn't drift.
+SKIN_HUE_DEADBAND = 3.0
+SKIN_HUE_GAIN = 1.5  # Orange hue units per degree of skin hue, before a step is measured
+SKIN_HUE_STEP = 10.0
+SKIN_HUE_LIMIT = 15.0  # total Orange hue change on one photo
+SKIN_HUE_PASSES = 2
+SKIN_HUE_NEUTRAL_SLACK = 0.5
 # The reference's Vibrance, Saturation and HSL cuts are copied to every photo, so a
 # close-up that fills the frame with gold and red ends far more colourful than the
 # wide reference it should match. A photo whose mean and top chroma are both at least
@@ -349,6 +370,7 @@ def run_match(
     grades_dir=None,
     refit=False,
     hold_shoot_wb=False,
+    skin_hue=False,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
@@ -371,6 +393,8 @@ def run_match(
     hold_shoot_wb: a raw from the reference's shoot that is no longer on As
         Shot keeps the reference's white balance (SHOOT_HOLD_MIRED). Off by
         default until real runs (engine/replay.py bench) show it helps.
+    skin_hue: with `skin`, faces redder than the reference's get a small
+        Orange hue change (SKIN_HUE_DEADBAND). Off by default.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -541,6 +565,11 @@ def run_match(
                 # bright exterior): match its colour, keep its own brightness.
                 s["options"] = replace(s["options"], color_only=True)
                 s["extra_flags"].append("different_scene")
+            if len(s["history"]) == 1 and s["options"].skin and _false_skin(ref_metrics, metrics):
+                # What reads as skin here is not like the reference's faces at all
+                # (candles and flowers at night, DSC01250): it would steer the solve.
+                s["options"] = replace(s["options"], skin=False)
+                s["extra_flags"].append("skin_not_matched")
             if len(s["history"]) == 1 and not s["same_shoot"] and not s["options"].color_only:
                 s["target"] = content_target(ref_metrics, metrics, CONTENT_KEEP)
             # With the look stage on, settle the light more tightly first: a
@@ -597,6 +626,8 @@ def run_match(
     if skin:
         _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
         _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
+        if skin_hue:
+            _anchor_hue_on_skin(bridge, state, creative, ref_metrics, out_dir, size, hint, warnings, log)
 
     if look and not (per_photo_look or style or grade_fit):
         _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint,
@@ -699,6 +730,7 @@ def run_match(
             "skin_exposure": s.get("skin_exposure"),
             "skin_color": s.get("skin_color"),
             "skin_color_note": s.get("skin_color_note"),
+            "skin_hue": s.get("skin_hue"),
             "calmed_colour": s.get("calmed_colour"),
             "trace": _trace(s, ref_metrics),
             "flags": s["flags"] + s["extra_flags"],
@@ -735,6 +767,15 @@ def _luminance(L):
 
 def _reliable_skin(m):
     return m.skin_L is not None and m.skin_fraction >= SKIN_ANCHOR_MIN_FRACTION
+
+
+def _false_skin(ref_metrics, m):
+    """Skin-coloured pixels whose colour is far from the reference's faces, judged on
+    the first render (so every render of the solve is scored the same way)."""
+    if not (_reliable_skin(ref_metrics) and m.skin_a is not None):
+        return False
+    ref_chroma = float(np.hypot(ref_metrics.skin_a, ref_metrics.skin_b))
+    return abs(float(np.hypot(m.skin_a, m.skin_b)) - ref_chroma) > SKIN_FALSE_CHROMA
 
 
 def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print):
@@ -910,6 +951,85 @@ def _skin_safe_calm(s, offsets, ref_chroma, ref_skin_chroma, log):
     best = min(steps, key=distance)
     log(f"{s['photo']['fileName']}: calmed colour only partway to keep the faces' warmth")
     return {k: min(v, 0.0) for k, v in best["offsets"].items()}
+
+
+def _skin_hue(m):
+    return float(np.degrees(np.arctan2(m.skin_b, m.skin_a)))
+
+
+def _anchor_hue_on_skin(bridge, state, creative, ref_metrics, out_dir, size, hint, warnings, log=print):
+    """Turn faces that are redder than the reference's toward its skin hue with
+    Orange hue (see SKIN_HUE_DEADBAND). White balance is left as it is."""
+    if not _reliable_skin(ref_metrics):
+        return
+    ref_hue = _skin_hue(ref_metrics)
+    ref_chroma = float(np.hypot(ref_metrics.skin_a, ref_metrics.skin_b))
+
+    def trusted(m):
+        return _reliable_skin(m) and abs(float(np.hypot(m.skin_a, m.skin_b)) - ref_chroma) <= SKIN_ANCHOR_CHROMA
+
+    live = {}
+    for pid, s in state.items():
+        m = s["final_metrics"]
+        if s["options"].color_only or "different_scene" in s["extra_flags"] or not trusted(m):
+            continue
+        if ref_hue - _skin_hue(m) > SKIN_HUE_DEADBAND:
+            base = float((s.get("look_settings") or {}).get("HueAdjustmentOrange",
+                                                             creative.get("HueAdjustmentOrange", 0.0)) or 0.0)
+            live[pid] = {"base": base, "value": base, "gain": SKIN_HUE_GAIN, "hue": _skin_hue(m)}
+    for n in range(SKIN_HUE_PASSES):
+        moves = {}
+        for pid, h in live.items():
+            gap = ref_hue - h["hue"]
+            if gap <= SKIN_HUE_DEADBAND / 2:
+                continue
+            step = float(np.clip(h["gain"] * gap, 0.0, SKIN_HUE_STEP))
+            value = min(h["value"] + step, h["base"] + SKIN_HUE_LIMIT, 100.0)
+            if value - h["value"] >= 1.0:
+                moves[pid] = round(value, 1)
+        if not moves:
+            break
+        _apply(bridge, [{"id": pid, "settings": {"HueAdjustmentOrange": v}} for pid, v in moves.items()],
+               warnings, log)
+        hue_dir = out_dir / ("skin_hue" if n == 0 else f"skin_hue_{n + 1}")
+        hue_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(hue_dir / f"{_safe(state[pid]['photo'])}.jpg")} for pid in moves]
+        bridge.render(items, size=size)
+        undo = []
+        for item in items:
+            pid = item["id"]
+            s, h = state[pid], live[pid]
+            m, before = measure_file(item["path"], hint), s["final_metrics"]
+            helped = (
+                trusted(m)
+                and abs(ref_hue - _skin_hue(m)) < abs(ref_hue - h["hue"])
+                and match_error(ref_metrics, m, color_only=True)
+                <= match_error(ref_metrics, before, color_only=True) + SKIN_HUE_NEUTRAL_SLACK
+            )
+            if not helped:
+                log(f"{s['photo']['fileName']}: faces' hue left as it was (Orange hue {moves[pid] - h['value']:+.0f} "
+                    f"moved them {h['hue']:.1f}° -> {_skin_hue(m):.1f}°, reference {ref_hue:.1f}°)")
+                undo.append({"id": pid, "settings": {"HueAdjustmentOrange": h["value"]}})
+                del live[pid]
+                continue
+            moved = _skin_hue(m) - h["hue"]
+            if moved > 0.2:
+                h["gain"] = (moves[pid] - h["value"]) / moved
+            first = s.get("skin_hue") or {"reference": round(ref_hue, 1), "before": round(h["hue"], 1)}
+            h["value"], h["hue"] = moves[pid], _skin_hue(m)
+            s["skin_hue"] = {**first, "after": round(h["hue"], 1),
+                             "HueAdjustmentOrange": round(h["value"] - h["base"], 1)}
+            s["look_settings"] = {**(s.get("look_settings") or {}), "HueAdjustmentOrange": h["value"]}
+            s["final_metrics"], s["preview"] = m, item["path"]
+            if "skin_hue_from_faces" not in s["extra_flags"]:
+                s["extra_flags"].append("skin_hue_from_faces")
+        if undo:
+            _apply(bridge, undo, warnings, log)
+    for s in state.values():
+        if s.get("skin_hue"):
+            log(f"{s['photo']['fileName']}: faces turned toward the reference's hue "
+                f"({s['skin_hue']['before']}° -> {s['skin_hue']['after']}°, reference {s['skin_hue']['reference']}°; "
+                f"Orange hue {s['skin_hue']['HueAdjustmentOrange']:+.0f})")
 
 
 def _shift_wb(sliders, dx, is_raw):
@@ -1661,6 +1781,15 @@ def _write_outputs(out_dir, report):
     out_dir = Path(out_dir)
     contact_sheet.build(_tiles(report, "start_preview"), out_dir / "contact_sheet_before.jpg")
     contact_sheet.build(_tiles(report, "preview"), out_dir / "contact_sheet.jpg")
+    # The same, a few photos at a time next to the reference, so the colours are
+    # big enough to judge when the run has many photos (contact_sheet_1.jpg, ...).
+    after = _tiles(report, "preview")
+    for old in out_dir.glob("contact_sheet_[0-9]*.jpg"):
+        old.unlink()
+    if len(after) > 1 + SHEET_GROUP:
+        for n, i in enumerate(range(1, len(after), SHEET_GROUP), start=1):
+            tiles = [after[0]] + after[i:i + SHEET_GROUP]
+            contact_sheet.build(tiles, out_dir / f"contact_sheet_{n}.jpg", size=SHEET_GROUP_TILE)
     report["contact_sheet"] = str(out_dir / "contact_sheet.jpg")
     report["contact_sheet_before"] = str(out_dir / "contact_sheet_before.jpg")
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
@@ -1919,6 +2048,8 @@ def main(argv=None):
                         "reference from outside the catalog, use this instead of copying one grade")
     m.add_argument("--original", help="file name of the reference's unedited original, if not found by name")
     m.add_argument("--refit", action="store_true", help="learn an exported reference's grade again")
+    m.add_argument("--skin-hue", action="store_true",
+                   help="with --skin: faces redder than the reference's get a small Orange hue change")
     m.add_argument("--hold-shoot-wb", action="store_true",
                    help="photos from the reference's shoot keep its white balance (when not on As Shot)")
     m.add_argument("--tolerance", type=float, default=2.0)
@@ -1957,7 +2088,7 @@ def main(argv=None):
                                look=not args.no_look, look_strength=args.look_strength,
                                look_per_photo=args.look_per_photo, original=args.original,
                                grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
-                               hold_shoot_wb=args.hold_shoot_wb)
+                               hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,
