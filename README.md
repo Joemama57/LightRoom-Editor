@@ -59,6 +59,7 @@ More docs:
 By hand:
 ```
 .venv/bin/python -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--look-strength 1.0] [--original NAME] [--refit] [--look-per-photo] [--no-learning] [--skin-hue] [--hold-shoot-wb]
+.venv/bin/python -m engine.workflow match --skin [--face-skin] [--skin-error] [--skin-wb]   # opt-in skin options; --face-skin needs requirements-faces.txt
 .venv/bin/python -m engine.workflow nudge --run ~/.matchlook/runs/<time> --photo DSC0042 Exposure2012=+0.2 SaturationAdjustmentBlue=+8
 .venv/bin/python -m engine.workflow nudge --run ... --photo DSC0042 --mask subject Temperature=-10
 .venv/bin/python -m engine.workflow learn [--skip] # learn now from edits made since the last run (or skip it)
@@ -76,6 +77,7 @@ engine/                    measure, solver (light), look (colour and contrast), 
 data/skin_sources.json     measured skin colour data (with sources and licenses)
 tools/build_skin_model.py  builds engine/data/skin_model.json and docs/SKIN_TONES.md from it
 .claude/skills/match-look  the /match-look command for Claude Code
+engine/faces.py, subject.py  opt-in face-anchored skin, skin-weighted error and skin white balance
 tests/                     pytest suite (a simulated Lightroom, plus the plugin's Lua run under Lua 5.1)
 ```
 

@@ -314,7 +314,9 @@ def rerun(run_dir, out_dir=None, emulators=None, log=lambda m: None, **options):
     out_dir = Path(out_dir) if out_dir else run_dir / "replay" / time.strftime("%Y%m%d-%H%M%S")
     kwargs = dict(skin=opts.get("skin", False), color_only=opts.get("color_only", False),
                   look=opts.get("look", True), strength=report.get("strength", 1.0),
-                  tolerance=report.get("tolerance", 2.0), size=report.get("size", 1024))
+                  tolerance=report.get("tolerance", 2.0), size=report.get("size", 1024),
+                  **{k: v for k, v in (opts.get("subject") or {}).items()
+                     if k in ("face_skin", "skin_error", "skin_wb")})
     kwargs.update(options)
     return run_match(bridge, out_dir, learner=None, log=log, label="", **kwargs), bridge
 
@@ -427,6 +429,17 @@ def report_is_raw(report, pid):
     return next((p["is_raw"] for p in report["photos"] if p["id"] == pid), True)
 
 
+def _subject_args(parser):
+    from .workflow import _subject_args as add
+    add(parser)
+
+
+def _subject_options(args):
+    """Only the flags given, so a rerun otherwise keeps the run's own options."""
+    from .workflow import subject_kwargs
+    return {k: v for k, v in subject_kwargs(args).items() if v}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Replay saved Match Look runs without Lightroom.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -438,6 +451,7 @@ def main(argv=None):
     b.add_argument("runs", nargs="+")
     for cmd in (b, sub.choices["rerun"]):
         cmd.add_argument("--hold-shoot-wb", action="store_true", help="try the shoot white-balance hold")
+        _subject_args(cmd)
     args = parser.parse_args(argv)
     try:
         if args.cmd == "check":
@@ -445,7 +459,8 @@ def main(argv=None):
         elif args.cmd == "rerun":
             run_dir = Path(args.run)
             before = load_report(run_dir)
-            report, _ = rerun(run_dir, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb)
+            report, _ = rerun(run_dir, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
+                              **_subject_options(args))
             old = {p["fileName"]: p for p in before["photos"]}
             rows = [{"photo": p["fileName"],
                      "as_run": {k: old[p["fileName"]]["final"][k] for k in ("Temperature", "Tint", "Exposure2012")},
@@ -456,8 +471,8 @@ def main(argv=None):
             from .bridge import Bridge
             print(json.dumps(save_answers(Bridge(), Path(args.run)), indent=1))
         else:
-            print(json.dumps(bench(args.runs, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb),
-                             indent=1))
+            print(json.dumps(bench(args.runs, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
+                                   **_subject_options(args)), indent=1))
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

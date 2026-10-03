@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from . import align, contact_sheet
+from . import align, contact_sheet, faces, subject
 from . import look as look_stage
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
@@ -350,7 +350,33 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
     return learned
 
 
-def run_match(
+def run_match(bridge, out_dir, *, face_skin=False, skin_error=False, skin_wb=False, **kwargs):
+    """Match the selected photos to the active one: _run_match, plus the opt-in
+    subject-first colour options (engine/subject.py). Each turns on `skin`.
+
+    face_skin: measure skin inside detected faces only (engine/faces.py).
+    skin_error: judge renders with the skin-weighted CIEDE2000 error.
+    skin_wb: solve white balance toward the reference's skin, neutrals as a
+        guard. Needs skin from faces, so it turns on face_skin too.
+    """
+    face_skin = face_skin or skin_wb
+    if face_skin or skin_error or skin_wb:
+        kwargs["skin"] = True
+    with subject.use(face_skin=face_skin, skin_error=skin_error, skin_wb=skin_wb) as chosen:
+        report = _run_match(bridge, out_dir, **kwargs)
+        note = faces.fallback_warning()
+    if any(chosen.report().values()) or note:
+        report["options"]["subject"] = chosen.report()
+        if face_skin:
+            report["options"]["subject"]["face_detector"] = faces.available()
+        if note:
+            report["warnings"].append(note)
+            kwargs.get("log", print)(f"Warning: {note}")
+        (Path(out_dir) / "report.json").write_text(json.dumps(report, indent=2))
+    return report
+
+
+def _run_match(
     bridge,
     out_dir,
     strength=1.0,
@@ -2031,6 +2057,22 @@ def run_calibrate(bridge, out_dir, learner, size=768, log=print):
             "learning": learner.summary()["sensitivity_samples"]}
 
 
+def _subject_args(parser):
+    """The opt-in subject-first colour flags (engine/subject.py); each turns on --skin."""
+    parser.add_argument("--face-skin", action="store_true",
+                        help="measure skin inside detected faces only (needs requirements-faces.txt; "
+                             "falls back to colour-picked skin without it)")
+    parser.add_argument("--skin-error", action="store_true",
+                        help="judge renders with a skin-weighted CIEDE2000 error (faces count 4x the background)")
+    parser.add_argument("--skin-wb", action="store_true",
+                        help="solve white balance toward the reference's skin hue, neutrals only as a guard "
+                             "(faces only: turns on --face-skin)")
+
+
+def subject_kwargs(args):
+    return {"face_skin": args.face_skin, "skin_error": args.skin_error, "skin_wb": args.skin_wb}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Match the look of the active Lightroom photo across the selection.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -2052,6 +2094,7 @@ def main(argv=None):
                    help="with --skin: faces redder than the reference's get a small Orange hue change")
     m.add_argument("--hold-shoot-wb", action="store_true",
                    help="photos from the reference's shoot keep its white balance (when not on As Shot)")
+    _subject_args(m)
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -2088,7 +2131,7 @@ def main(argv=None):
                                look=not args.no_look, look_strength=args.look_strength,
                                look_per_photo=args.look_per_photo, original=args.original,
                                grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
-                               hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue)
+                               hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue, **subject_kwargs(args))
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,

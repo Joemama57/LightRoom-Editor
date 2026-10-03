@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 from PIL import Image
 
+from . import faces as face_model
 from . import skin as skin_model
 from .colorspace import srgb_to_lab
 
@@ -32,6 +33,7 @@ class Metrics:
     skin_b: float = None
     skin_fraction: float = 0.0
     skin_L: float = None
+    skin_source: str = None  # "faces" when skin was measured inside detected faces (--face-skin)
 
     def to_dict(self):
         return asdict(self)
@@ -55,18 +57,22 @@ def _downsample(img):
     return img[::step, ::step]
 
 
-def measure(img, neutral_hint=None):
+def measure(img, neutral_hint=None, face_boxes=None):
     """Measure an sRGB image (float in [0, 1] or uint8).
 
     neutral_hint: (a*, b*) where this photo's neutrals are expected, normally
     the reference's neutral axis. The search for near-gray pixels starts there,
     so a frame dominated by one colour (foliage, a red wall) isn't mistaken
     for a colour cast. Ignored if no gray-ish pixels are found near it.
+    face_boxes: with face skin on (engine/faces.py), the faces found in this
+    image; None finds them here.
     """
     img = np.asarray(img)
     if img.dtype == np.uint8:
         img = img.astype(np.float64) / 255.0
-    img = _downsample(img).reshape(-1, 3)
+    img = _downsample(img)
+    grid = img.shape[:2]
+    img = img.reshape(-1, 3)
 
     clipped = (img < CLIP_LOW).any(axis=1) | (img > CLIP_HIGH).any(axis=1)
     lab = srgb_to_lab(img)
@@ -104,7 +110,14 @@ def measure(img, neutral_hint=None):
     # Skin: membership from the measured skin-tone model (engine/skin.py). The
     # mean is weighted by membership so pixels near the edge of the skin band
     # fade in and out smoothly between renders instead of flipping.
-    w = skin_model.weights(usable)
+    w, skin_source = None, None
+    if face_model.active():
+        boxes = face_boxes if face_boxes is not None else face_model.detect(img.reshape(*grid, 3))
+        if boxes is not None:
+            full = face_model.weights(lab.reshape(*grid, 3), boxes).reshape(-1)
+            w, skin_source = (full if len(usable) == len(full) else full[~clipped]), "faces"
+    if w is None:
+        w = skin_model.weights(usable)
     skin = w >= skin_model.MIN_WEIGHT
     skin_fraction = float(skin.sum()) / len(img)
     if skin.any():
@@ -123,8 +136,10 @@ def measure(img, neutral_hint=None):
         skin_b=skin_b,
         skin_fraction=skin_fraction,
         skin_L=skin_L,
+        skin_source=skin_source,
     )
 
 
 def measure_file(path, neutral_hint=None):
-    return measure(load_image(path), neutral_hint)
+    boxes = face_model.detect_file(path) if face_model.active() else None
+    return measure(load_image(path), neutral_hint, boxes)

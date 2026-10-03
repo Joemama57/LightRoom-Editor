@@ -11,10 +11,11 @@ refines them from the renders it has seen (Broyden updates) and takes damped
 Newton steps toward the reference's metrics.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from . import subject
 from .colorspace import delta_e_2000
 from .measure import Metrics
 
@@ -113,6 +114,12 @@ class Options:
     # whose brightness is held near the reference's: its tone gap is content, a
     # constant that would otherwise decide which white balance counts as "best".
     judge_colour: bool = False
+    # Opt-in subject-first colour (engine/subject.py), on only with `skin`:
+    # judge renders with the skin-weighted CIEDE2000 error, and solve white
+    # balance toward the reference's skin instead of the neutrals. They default
+    # to the run's options (subject.use), so the workflow needn't pass them.
+    skin_error: bool = field(default_factory=lambda: subject.current().skin_error)
+    skin_wb: bool = field(default_factory=lambda: subject.current().skin_wb)
 
 
 @dataclass
@@ -157,6 +164,8 @@ def _as_metrics(m):
 
 def _has_skin(m):
     m = _as_metrics(m)
+    if m.skin_source == "faces":
+        return subject.has_skin(m)  # skin from faces: trusted at a smaller share of the frame
     return m.skin_a is not None and m.skin_fraction >= MIN_SKIN_FRACTION
 
 
@@ -165,18 +174,21 @@ def _metric_vector(m):
     return np.array([m.b, m.a] + [m.L[k] for k in METRIC_KEYS[2:]])
 
 
-def match_error(ref, target, skin=False, color_only=False, light_only=False):
+def match_error(ref, target, skin=False, color_only=False, light_only=False, subject_colour=None):
     """One number for how far a render is from the reference (roughly ΔE00 units).
 
     Combines the color difference of the neutral axis (measured at mid-gray) with
     a weighted RMS of the L* percentile differences. With `skin`, the skin-tone
     color difference is averaged in with the neutral one (when both photos have
-    skin). With `color_only`, tone is ignored.
+    skin). With `color_only`, tone is ignored. `subject_colour` replaces the
+    colour part (the skin-weighted error, engine/subject.py) when given.
     """
     r = _as_metrics(ref)
     t = _as_metrics(target)
     color = float(delta_e_2000([50.0, r.a, r.b], [50.0, t.a, t.b]))
-    if skin and _has_skin(r) and _has_skin(t):
+    if subject_colour is not None:
+        color = subject_colour
+    elif skin and _has_skin(r) and _has_skin(t):
         skin_de = float(delta_e_2000([60.0, r.skin_a, r.skin_b], [60.0, t.skin_a, t.skin_b]))
         color = float(np.sqrt((color**2 + skin_de**2) / 2))
     if color_only:
@@ -215,6 +227,16 @@ def content_target(ref, first, keep):
     return replace(r, L=L)
 
 
+def solve_error(ref, m, opts):
+    """The error the solve judges renders by: match_error, with the colour
+    part skin-weighted when `skin_error` or `skin_wb` is on (and both have skin)."""
+    sub = None
+    if opts.skin and (opts.skin_error or opts.skin_wb):
+        sub = subject.subject_colour(ref, m, guard=opts.skin_wb)
+    return match_error(ref, m, skin=opts.skin, color_only=opts.color_only or opts.judge_colour,
+                       light_only=opts.light_only, subject_colour=sub)
+
+
 def default_prior(is_raw):
     return (_PRIOR_RAW if is_raw else _PRIOR_JPEG).copy()
 
@@ -250,8 +272,7 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     target = _metric_vector(ref)
     xs = [_to_internal(h["sliders"], is_raw) for h in history]
     ms = [_metric_vector(h["metrics"]) for h in history]
-    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only or opts.judge_colour,
-                          light_only=opts.light_only) for h in history]
+    errors = [solve_error(ref, h["metrics"], opts) for h in history]
     best = int(np.argmin(errors))
 
     iterations = len(history) - 1
@@ -306,11 +327,31 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     else:
         active = list(range(len(CORRECTIVE))) if settled else LIGHT
 
+    # Skin white balance (opt-in): the colour rows chase the reference's skin
+    # hue (then chroma); the neutrals stay in, weakly, and guard the step below.
+    # Only skin measured inside faces: colour-picked skin hardly moves with white
+    # balance (pixels join and leave the skin band; 92 render pairs of the real
+    # runs gave skin b* +0.05 per mired against neutral b* -0.09).
+    skin_wb = None
+    if (opts.skin and opts.skin_wb and _as_metrics(ref).skin_source == "faces"
+            and _as_metrics(history[-1]["metrics"]).skin_source == "faces"):
+        base = (default_prior(is_raw) if opts.prior is None else np.asarray(opts.prior, dtype=float))[[0, 1]]
+        skin_J = subject.skin_jacobian(xs, [h["metrics"] for h in history], base * SLIDER_SCALE, SLIDER_SCALE)
+        skin_wb = subject.skin_rows(ref, history[-1]["metrics"], skin_J)
+    if skin_wb is not None:
+        s_diff, s_rows, s_weights = skin_wb
+        weights[:2] = weights[:2] * subject.NEUTRAL_WEIGHT
+        diff = np.concatenate([diff, s_diff])
+        J = np.vstack([J, s_rows])
+        weights = np.concatenate([weights, s_weights])
+        if not (opts.color_only or opts.light_only) and float(np.hypot(np.hypot(*s_diff), diff[4])) <= LIGHT_SETTLED:
+            active = list(range(len(CORRECTIVE)))
+
     # Skin guard: once the light is close, also pull skin tones toward the
     # reference's. Skin pixels are picked by color, so under a strong cast the
     # selection is unreliable; that's why it waits. Skin answers white balance
     # the way the neutral axis does, so it borrows those sensitivity rows.
-    if opts.skin and settled and _has_skin(ref) and _has_skin(history[-1]["metrics"]):
+    if skin_wb is None and opts.skin and settled and _has_skin(ref) and _has_skin(history[-1]["metrics"]):
         r_m, t_m = _as_metrics(ref), _as_metrics(history[-1]["metrics"])
         diff = np.concatenate([diff, [t_m.skin_b - r_m.skin_b, t_m.skin_a - r_m.skin_a]])
         J = np.vstack([J, J[[0, 1]]])
@@ -330,6 +371,8 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     # Cap the step so one bad sensitivity estimate can't fling a slider across its range.
     du = np.clip(du, -4.0, 4.0)
     x_next = (u_cur + du) * SLIDER_SCALE
+    if skin_wb is not None:
+        x_next = subject.guard_neutrals(x_next, xs[-1], ms[-1][:2], target[:2], J, SLIDER_SCALE)
     x_next = _limit_white_balance(x_next, xs[0], opts.wb_limits)
     x_next = _limit_tone(x_next, xs[0], opts.tone_limits)
     if settled_on(x_next):
