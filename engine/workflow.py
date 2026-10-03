@@ -38,8 +38,8 @@ from .learning import Learner, light_bucket, same_light
 from .colorspace import delta_e_2000, srgb_to_lab
 from .measure import Metrics, load_image, measure_file
 from .settings import camera_white_balance, is_raw, split, starting_corrective
-from .solver import (CORRECTIVE, MIN_SKIN_FRACTION, Options, _to_internal, _to_sliders, at_tone_limit, blend, clamp,
-                     match_error, propose, wb_limits)
+from .solver import (CORRECTIVE, MIN_SKIN_FRACTION, Options, _limit_white_balance, _to_internal, _to_sliders,
+                     at_tone_limit, blend, clamp, content_target, default_prior, match_error, propose, wb_limits)
 
 RUNS_DIR = Path.home() / ".matchlook" / "runs"
 SNAPSHOT_NAME = "Before Match Look"
@@ -82,9 +82,32 @@ REF_AS_SHOT_MINUTES = 10.0
 # Skin readings covering little of the frame, or far more or less colourful than
 # the reference's (fabric, henna), aren't trusted.
 SKIN_ANCHOR_DEADBAND = 3.0
+# Faces already brighter than the reference's are left alone unless they are this
+# much brighter (blown-out faces): darkening them to the reference's follows the
+# crowd scene's shadows, and it undoes the brightness kept by CONTENT_KEEP.
+SKIN_ANCHOR_BRIGHT_DEADBAND = 8.0
+# Matching every L* percentile to the reference's follows its content: a close-up
+# of cream clothes and white garlands is darkened to a crowd scene's histogram
+# (the reference's own exposure left it 13 L* brighter, and the match took all of
+# that away). For a photo that isn't from the reference's shoot, this share of the
+# brightness gap that the reference's own exposure leaves (p25..p75, measured on
+# the first render) is kept as content, and only the rest is matched.
+CONTENT_KEEP = 0.5
 SKIN_ANCHOR_EV = 0.5
 SKIN_ANCHOR_MIN_FRACTION = 0.03
 SKIN_ANCHOR_CHROMA = 10.0
+# In a frame of coloured saris and gold backdrops the "neutral" pixels are a guess,
+# so after the solve the faces can still be off the reference's in colour (the report
+# says "more magenta", "bluer / cooler"). With --skin, a photo whose skin (a*, b*) is
+# more than SKIN_COLOR_DEADBAND from the reference's gets up to SKIN_COLOR_PASSES small
+# white-balance moves read from the faces, each re-rendered and kept only if the skin
+# got closer without the neutrals drifting more than SKIN_COLOR_NEUTRAL_SLACK (ΔE).
+SKIN_COLOR_DEADBAND = 2.0
+SKIN_COLOR_MIRED = 15.0  # largest Temperature move per pass (mired; offset units for JPEG)
+SKIN_COLOR_TINT = 10.0
+SKIN_COLOR_PASSES = 2
+SKIN_COLOR_DAMPING = 0.8
+SKIN_COLOR_NEUTRAL_SLACK = 1.5
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -444,6 +467,7 @@ def run_match(
             "shoot_wb": shoot and t_raw and wb_from_camera,
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
+            "target": ref_metrics,
         }
 
     _apply(
@@ -473,9 +497,11 @@ def run_match(
                 # bright exterior): match its colour, keep its own brightness.
                 s["options"] = replace(s["options"], color_only=True)
                 s["extra_flags"].append("different_scene")
+            if len(s["history"]) == 1 and not s["same_shoot"] and not s["options"].color_only:
+                s["target"] = content_target(ref_metrics, metrics, CONTENT_KEEP)
             # With the look stage on, settle the light more tightly first: a
             # leftover cast would otherwise be "fixed" with HSL instead of white balance.
-            p = propose(ref_metrics, s["history"], is_raw=s["is_raw"],
+            p = propose(s["target"], s["history"], is_raw=s["is_raw"],
                         tolerance=tolerance * LOOK_LIGHT_TOLERANCE if per_photo_look else tolerance,
                         max_iterations=max_iterations, options=s["options"])
             s["proposal"] = p
@@ -497,7 +523,7 @@ def run_match(
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
-        errors = [match_error(ref_metrics, h["metrics"], skin=o.skin, color_only=o.color_only,
+        errors = [match_error(s["target"], h["metrics"], skin=o.skin, color_only=o.color_only,
                               light_only=o.light_only) for h in s["history"]]
         best = min(range(len(errors)), key=errors.__getitem__)
         matched = s["matched"]
@@ -526,27 +552,35 @@ def run_match(
 
     if skin:
         _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
+        _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
 
     if per_photo_look:
         _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint)
 
     for s in state.values():
         o = s["options"]
-        s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only,
+        s["final_error"] = match_error(s["target"], s["final_metrics"], skin=o.skin, color_only=o.color_only,
                                        light_only=o.light_only)
         s["flags"] = flags_for(s["final_metrics"], s["proposal"], tolerance)
         # Only worth a look when the limit kept it from matching. A photo from
         # the reference's shoot is held near its exposure on purpose: what's
         # left is content, not a failed match.
+        # Its exposure was set from the faces on purpose: what's left of the error is the frame's content.
+        faces_set = ("exposure_from_skin" in s["extra_flags"]
+                     and match_error(ref_metrics, s["final_metrics"], skin=True, color_only=True) < tolerance)
         if s["same_shoot"]:
             # Judge it on colour alone: its brightness differs by content.
             color_error = match_error(ref_metrics, s["final_metrics"], color_only=True)
             if color_error < tolerance and "not_converged" in s["flags"]:
                 s["flags"].remove("not_converged")
+        elif faces_set:
+            if "not_converged" in s["flags"]:
+                s["flags"].remove("not_converged")
         elif s["final_error"] >= tolerance and not o.color_only and at_tone_limit(s["start"], s["proposal"].sliders, s["is_raw"], o.tone_limits):
             s["flags"].append("tone_limited")
         unscaled = strength == 1.0 and not s["learned_adjustment"]
-        if unscaled and not s["same_shoot"] and s["final_error"] >= tolerance and "not_converged" not in s["flags"]:
+        if (unscaled and not s["same_shoot"] and not faces_set and s["final_error"] >= tolerance
+                and "not_converged" not in s["flags"]):
             s["flags"].append("not_converged")
         if s.get("look_limited"):
             s["flags"].append("look_limited")
@@ -603,6 +637,8 @@ def run_match(
             "look_settings": s.get("look_settings", {}),
             "look_note": s.get("look_note"),
             "skin_exposure": s.get("skin_exposure"),
+            "skin_color": s.get("skin_color"),
+            "trace": _trace(s, ref_metrics),
             "flags": s["flags"] + s["extra_flags"],
             "skin": t_skin,
             "skin_vs_reference": skin_model.compare(ref_skin, t_skin) if ref_skin and t_skin else None,
@@ -612,6 +648,22 @@ def run_match(
     _label_flagged(bridge, report, label)
     _write_outputs(out_dir, report)
     return report
+
+
+def _trace(s, ref_metrics):
+    """One line per render of the solve (sliders and what they measured), to see why a photo stalled."""
+    o = s["options"]
+    rows = []
+    for h in s["history"]:
+        m = Metrics.from_dict(h["metrics"])
+        rows.append({
+            **{k: h["sliders"][k] for k in ("Temperature", "Tint", "Exposure2012")},
+            "error": round(match_error(s["target"], m, skin=o.skin, color_only=o.color_only, light_only=o.light_only), 2),
+            "a": round(m.a, 1), "b": round(m.b, 1), "p50": round(m.L["p50"], 1),
+            "skin_a": None if m.skin_a is None else round(m.skin_a, 1),
+            "skin_b": None if m.skin_b is None else round(m.skin_b, 1),
+        })
+    return rows
 
 
 def _luminance(L):
@@ -638,7 +690,8 @@ def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, wa
             continue
         if abs(float(np.hypot(m.skin_a, m.skin_b)) - ref_chroma) > SKIN_ANCHOR_CHROMA:
             continue
-        if abs(m.skin_L - ref_metrics.skin_L) <= SKIN_ANCHOR_DEADBAND:
+        gap = m.skin_L - ref_metrics.skin_L
+        if gap < 0 and -gap <= SKIN_ANCHOR_DEADBAND or gap > 0 and gap <= SKIN_ANCHOR_BRIGHT_DEADBAND:
             continue
         ev = float(np.log2(_luminance(ref_metrics.skin_L) / max(_luminance(m.skin_L), 1e-6)))
         moves[pid] = round(float(np.clip(ev, -SKIN_ANCHOR_EV, SKIN_ANCHOR_EV)), 2)
@@ -672,6 +725,106 @@ def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, wa
             undo.append({"id": pid, "settings": _corrective_settings(old[pid])})
     if undo:
         _apply(bridge, undo, warnings, log)
+
+
+def _shift_wb(sliders, dx, is_raw):
+    """`sliders` with Temperature and Tint moved by dx (internal units: mired for raw)."""
+    x = _to_internal(sliders, is_raw)
+    x[0], x[1] = x[0] + dx[0], x[1] + dx[1]
+    moved = _to_sliders(x, is_raw)
+    return {**sliders, "Temperature": moved["Temperature"], "Tint": moved["Tint"]}
+
+
+def _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print):
+    """Bring the faces' colour closer to the reference's with white balance (see
+    SKIN_COLOR_DEADBAND). Sensitivities start from the solver's prior and are
+    refined from each re-render. A photo whose white balance was set from its
+    shoot is left alone, and a move that doesn't help is put back."""
+    if not _reliable_skin(ref_metrics):
+        return
+    ref_chroma = float(np.hypot(ref_metrics.skin_a, ref_metrics.skin_b))
+
+    def trusted(m):
+        return _reliable_skin(m) and abs(float(np.hypot(m.skin_a, m.skin_b)) - ref_chroma) <= SKIN_ANCHOR_CHROMA
+
+    def gap(m):
+        return m.skin_a - ref_metrics.skin_a, m.skin_b - ref_metrics.skin_b
+
+    live = {}
+    for pid, s in state.items():
+        if "wb_from_shoot" in s["extra_flags"] or not trusted(s["final_metrics"]):
+            continue
+        prior = s["options"].prior if s["options"].prior is not None else default_prior(s["is_raw"])
+        live[pid] = np.array(prior, dtype=float)[:2, :2]  # skin (b, a) per (Temperature, Tint)
+    for n in range(SKIN_COLOR_PASSES):
+        moves = {}
+        for pid, J in live.items():
+            s = state[pid]
+            da, db = gap(s["final_metrics"])
+            if float(np.hypot(da, db)) <= SKIN_COLOR_DEADBAND:
+                continue
+            dx = np.linalg.lstsq(J, -np.array([db, da]), rcond=None)[0] * SKIN_COLOR_DAMPING
+            dx = np.clip(dx, [-SKIN_COLOR_MIRED, -SKIN_COLOR_TINT], [SKIN_COLOR_MIRED, SKIN_COLOR_TINT])
+            x = _to_internal(s["final"], s["is_raw"])
+            x_new = _limit_white_balance(x + np.concatenate([dx, np.zeros(len(x) - 2)]), _to_internal(s["start"], s["is_raw"]),
+                                         s["options"].wb_limits)
+            dx = (x_new - x)[:2]
+            if abs(dx[0]) >= 0.5 or abs(dx[1]) >= 0.5:
+                moves[pid] = dx
+        if not moves:
+            break
+        old = {pid: dict(state[pid]["final"]) for pid in moves}
+        for pid, dx in moves.items():
+            s = state[pid]
+            s["final"] = _shift_wb(s["final"], dx, s["is_raw"])
+        _apply(bridge, [{"id": pid, "settings": _corrective_settings(state[pid]["final"])} for pid in moves],
+               warnings, log)
+        skin_dir = out_dir / ("skin_color" if n == 0 else f"skin_color_{n + 1}")
+        skin_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(skin_dir / f"{_safe(state[pid]['photo'])}.jpg")} for pid in moves]
+        bridge.render(items, size=size)
+        undo = []
+        for item in items:
+            pid = item["id"]
+            s = state[pid]
+            m = measure_file(item["path"], hint)
+            before = s["final_metrics"]
+            helped = (
+                trusted(m)
+                and float(np.hypot(*gap(m))) < float(np.hypot(*gap(before)))
+                and match_error(ref_metrics, m, skin=True, color_only=True)
+                < match_error(ref_metrics, before, skin=True, color_only=True)
+                and match_error(ref_metrics, m, color_only=True)
+                <= match_error(ref_metrics, before, color_only=True) + SKIN_COLOR_NEUTRAL_SLACK
+            )
+            if not helped:
+                if m.skin_a is not None:
+                    log(f"{s['photo']['fileName']}: kept its white balance (faces off by "
+                        f"{np.hypot(*gap(before)):.1f} -> {np.hypot(*gap(m)):.1f}, neutrals off by "
+                        f"{match_error(ref_metrics, before, color_only=True):.1f} -> "
+                        f"{match_error(ref_metrics, m, color_only=True):.1f})")
+                s["final"] = old[pid]
+                undo.append({"id": pid, "settings": _corrective_settings(old[pid])})
+                del live[pid]
+                continue
+            # What this move taught about how skin answers white balance (Broyden step).
+            du = moves[pid]
+            dm = np.array([m.skin_b - before.skin_b, m.skin_a - before.skin_a])
+            live[pid] = live[pid] + np.outer(dm - live[pid] @ du, du) / float(du @ du)
+            first = s.get("skin_color") or {
+                "before": {k: old[pid][k] for k in ("Temperature", "Tint")},
+                "skin_gap_before": round(float(np.hypot(*gap(before))), 1),
+            }
+            s["matched"] = _shift_wb(s["matched"], du, s["is_raw"])
+            s["skin_color"] = {**first, "after": {k: s["final"][k] for k in ("Temperature", "Tint")},
+                               "skin_gap_after": round(float(np.hypot(*gap(m))), 1)}
+            s["final_metrics"], s["preview"] = m, item["path"]
+            if "color_from_skin" not in s["extra_flags"]:
+                s["extra_flags"].append("color_from_skin")
+            log(f"{s['photo']['fileName']}: white balance moved to match the reference's faces "
+                f"(skin off by {first['skin_gap_before']} -> {s['skin_color']['skin_gap_after']})")
+        if undo:
+            _apply(bridge, undo, warnings, log)
 
 
 def _pull_shoot_outliers(state, log=print):

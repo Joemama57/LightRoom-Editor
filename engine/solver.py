@@ -11,7 +11,7 @@ refines them from the renders it has seen (Broyden updates) and takes damped
 Newton steps toward the reference's metrics.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -179,6 +179,32 @@ def match_error(ref, target, skin=False, color_only=False, light_only=False):
     w = METRIC_WEIGHTS[2:]
     tone = float(np.sqrt(np.sum(w * (tv[2:] - rv[2:]) ** 2) / np.sum(w)))
     return float(np.hypot(color, tone))
+
+
+# A first render with highlights beyond this, or this much more clipped than the
+# reference, is overexposed (not just bright content).
+BLOWN_P99 = 97.0
+BLOWN_EXTRA_CLIPPED = 0.05
+
+
+def content_target(ref, first, keep):
+    """The reference's metrics with the mid-tone brightness gap that the
+    reference's own exposure leaves (`first`: the photo rendered at the
+    reference's sliders) kept as content, `keep` of it (0..1).
+
+    Matching p25..p75 exactly makes a frame with brighter content (cream
+    clothes, white garlands) as dark as a darker scene; the edges and colour
+    stay the reference's.
+    """
+    r, f = _as_metrics(ref), _as_metrics(first)
+    if f.L["p99"] > BLOWN_P99 or f.clipped_fraction > r.clipped_fraction + BLOWN_EXTRA_CLIPPED:
+        return r  # overexposed rather than bright: it does need darkening
+    L = dict(r.L)
+    for k in ("p25", "p50", "p75"):
+        # Only brighter content: a darker frame at the reference's exposure is
+        # as likely underexposed, and brightening it is what the match is for.
+        L[k] = r.L[k] + keep * max(f.L[k] - r.L[k], 0.0)
+    return replace(r, L=L)
 
 
 def default_prior(is_raw):

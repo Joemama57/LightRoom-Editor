@@ -106,3 +106,24 @@ def test_jpeg_white_balance_and_tone_are_limited():
     start = np.zeros(7)
     x = _limit_tone(np.array([0, 0, 4.5, 90, -90, 10, 0.0]), start, TONE_LIMITS)
     assert x[2] == TONE_LIMITS[0] and x[3] == TONE_LIMITS[1] and x[4] == -TONE_LIMITS[1] and x[5] == 10
+
+
+def _flat(p50, p99=90.0, clipped=0.0):
+    from engine.measure import Metrics
+    return Metrics(a=0.0, b=0.0, L={"p1": 5.0, "p25": p50 - 15, "p50": p50, "p75": p50 + 15, "p99": p99},
+                   clipped_fraction=clipped, neutral_fraction=0.3)
+
+
+def test_content_target_keeps_part_of_a_brighter_frames_gap():
+    t = solver.content_target(_flat(50), _flat(70), 0.5)
+    assert (t.L["p25"], t.L["p50"], t.L["p75"]) == (45.0, 60.0, 75.0)
+    assert (t.L["p1"], t.L["p99"], t.a, t.b) == (5.0, 90.0, 0.0, 0.0)
+
+
+def test_content_target_leaves_a_darker_frame_to_be_brightened():
+    assert solver.content_target(_flat(50), _flat(35), 0.5).L["p50"] == 50
+
+
+def test_content_target_does_not_keep_an_overexposed_frame():
+    assert solver.content_target(_flat(50), _flat(70, p99=99.0), 0.5).L["p50"] == 50
+    assert solver.content_target(_flat(50), _flat(70, clipped=0.2), 0.5).L["p50"] == 50

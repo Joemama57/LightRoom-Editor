@@ -474,6 +474,16 @@ def test_other_shoots_are_matched_on_brightness(tmp_path, time, camera):
     assert p["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"] - 0.3  # the brighter content is pulled down
 
 
+def test_brighter_content_is_only_partly_darkened_to_the_references_histogram(tmp_path, monkeypatch):
+    import engine.workflow as wf
+    monkeypatch.setattr(wf, "CONTENT_KEEP", 0.0)
+    full = run_match(_shoot(5 * 3600.0), tmp_path / "full", log=quiet)["photos"][0]
+    monkeypatch.setattr(wf, "CONTENT_KEEP", 0.5)
+    part = run_match(_shoot(5 * 3600.0), tmp_path / "part", log=quiet)["photos"][0]
+    assert part["final"]["Exposure2012"] > full["final"]["Exposure2012"] + 0.2
+    assert part["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"]  # still darkened somewhat
+
+
 def _jpeg_ref_and_raw(target_time):
     """A JPEG reference and a raw file of a contrastier, tinted frame from the same camera."""
     scene = make_scene(seed=0)
@@ -683,3 +693,77 @@ def test_a_skin_exposure_that_doesnt_help_is_put_back(tmp_path):
     (p,) = report["photos"]
     assert "exposure_from_skin" not in p["flags"] and p["skin_exposure"] is None
     assert lr.photos["t"]["settings"]["Exposure2012"] == p["final"]["Exposure2012"]
+
+
+def _cool_portrait(kelvin=4900):
+    ref = photo(capture(_portrait(0), 5500), "P1.ARW", settings=dict(REF_SETTINGS))
+    t = photo(capture(_portrait(0)[4:, 2:], kelvin), "P2.ARW")
+    return FakeLightroom({"ref": ref, "t": t}, active="ref")
+
+
+def _skin_gap(report):
+    ref, skin = report["reference"]["skin"], report["photos"][0]["skin"]
+    return float(np.hypot(skin["a"] - ref["a"], skin["b"] - ref["b"]))
+
+
+def test_faces_still_off_after_the_solve_get_a_small_white_balance_move(tmp_path):
+    # Tolerance 6: the solve stops at once, leaving the faces 3.9 off the reference's.
+    plain = run_match(_cool_portrait(), tmp_path / "plain", skin=False, tolerance=6.0, log=quiet)
+    report = run_match(_cool_portrait(), tmp_path / "skin", skin=True, tolerance=6.0, log=quiet)
+    (p,) = report["photos"]
+    assert "color_from_skin" in p["flags"] and "color_from_skin" not in plain["photos"][0]["flags"]
+    assert _skin_gap(report) < _skin_gap(plain) - 1.0
+    assert p["skin_color"]["skin_gap_after"] < p["skin_color"]["skin_gap_before"]
+    assert p["skin_color"]["after"] == {"Temperature": p["final"]["Temperature"], "Tint": p["final"]["Tint"]}
+    for key in ("Temperature", "Tint"):
+        assert p["matched"][key] == p["final"][key]  # not learned as a preference later
+
+
+def test_faces_that_already_match_keep_their_white_balance(tmp_path):
+    report = run_match(_cool_portrait(5500), tmp_path, skin=True, tolerance=6.0, log=quiet)
+    (p,) = report["photos"]
+    assert "color_from_skin" not in p["flags"] and p["skin_color"] is None
+
+
+def test_a_skin_colour_move_that_doesnt_help_is_put_back(tmp_path):
+    lr = _cool_portrait()
+    real_render = lr.render
+
+    def render(items, size=1024):
+        if any("/skin_color" in i["path"] for i in items):
+            # This "Lightroom" renders the move wrongly: a strong green cast.
+            for i in items:
+                settings = lr.photos[i["id"]]["settings"]
+                saved = settings["Tint"]
+                settings["Tint"] = saved - 60
+                real_render([i], size)
+                settings["Tint"] = saved
+            return [i["path"] for i in items]
+        return real_render(items, size)
+
+    lr.render = render
+    report = run_match(lr, tmp_path, skin=True, tolerance=6.0, log=quiet)
+    (p,) = report["photos"]
+    assert "color_from_skin" not in p["flags"] and p["skin_color"] is None
+    assert lr.photos["t"]["settings"]["Temperature"] == p["final"]["Temperature"]
+    assert lr.photos["t"]["settings"]["Tint"] == p["final"]["Tint"]
+
+
+def test_a_photo_from_the_references_shoot_keeps_its_white_balance_limits(tmp_path):
+    lr = _cool_portrait(4900)
+    lr.photos["ref"]["captureTime"], lr.photos["t"]["captureTime"] = 0.0, 600.0
+    lr.photos["t"]["settings"] = {"Temperature": 4900, "Tint": 0, "Exposure2012": 0}  # As Shot: the camera's own
+    report = run_match(lr, tmp_path, skin=True, tolerance=6.0, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" in p["flags"]
+    start, final = p["start"]["Temperature"], p["final"]["Temperature"]
+    assert abs(1e6 / final - 1e6 / start) <= 20.0 + 0.5 and abs(p["final"]["Tint"] - p["start"]["Tint"]) <= 10.0 + 0.1
+
+
+def test_the_report_traces_every_render_of_the_solve(tmp_path):
+    report = run_match(_cool_portrait(), tmp_path, skin=True, log=quiet)
+    (p,) = report["photos"]
+    assert len(p["trace"]) == p["iterations"] + 1
+    assert p["trace"][0]["Temperature"] == p["start"]["Temperature"]
+    assert {"error", "a", "b", "p50", "skin_a", "skin_b"} <= set(p["trace"][0])
+    assert p["trace"][-1]["error"] <= p["trace"][0]["error"]
