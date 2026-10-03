@@ -209,12 +209,17 @@ class Plan:
                 "skin": self.skin}
 
 
-def make_plan(ref, cur, tone=True, split=True, skin=False):
-    """Decide which parts of the look to match for this photo."""
+def make_plan(ref, cur, tone=True, split=True, skin=False, max_ratio=None):
+    """Decide which parts of the look to match for this photo.
+
+    max_ratio: only match a band when it covers a similar share of both photos
+    (within this factor). Used when the photos show different things, so a
+    band that is mostly sky in one and a sliver in the other isn't "matched"."""
     plan = Plan(tone=tone, skin=bool(skin and ref.get("skin") and cur.get("skin")))
     for name in BANDS:
         f = min(ref["bands"][name]["f"], cur["bands"][name]["f"])
-        if f >= MIN_BAND_FRACTION:
+        similar = max_ratio is None or max(ref["bands"][name]["f"], cur["bands"][name]["f"]) <= max_ratio * f
+        if f >= MIN_BAND_FRACTION and similar:
             plan.bands.append(name)
             plan.band_weight[name] = float(min(1.0, f / FULL_BAND_FRACTION))
     if split:
@@ -324,18 +329,18 @@ def _vector(offsets, vars_):
     return np.array([float(offsets.get(v, 0.0)) for v in vars_])
 
 
-def _limit(x, vars_):
-    x = np.clip(x, -LIMIT, LIMIT)
+def _limit(x, vars_, limit=LIMIT, split_limit=SPLIT_LIMIT):
+    x = np.clip(x, -limit, limit)
     for name in ("shadow", "highlight"):
         if f"{name}_a" in vars_:
             i, j = vars_.index(f"{name}_a"), vars_.index(f"{name}_b")
             s = np.hypot(x[i], x[j])
-            if s > SPLIT_LIMIT:
-                x[[i, j]] *= SPLIT_LIMIT / s
+            if s > split_limit:
+                x[[i, j]] *= split_limit / s
     return x
 
 
-def propose_look(ref, history, plan, tolerance=1.0, max_iterations=4):
+def propose_look(ref, history, plan, tolerance=1.0, max_iterations=4, limit=LIMIT, split_limit=SPLIT_LIMIT):
     """Next look offsets to render, or the best found once done.
 
     history: [{"offsets": {...}, "look": {...}}, ...], oldest first; the first
@@ -351,7 +356,7 @@ def propose_look(ref, history, plan, tolerance=1.0, max_iterations=4):
 
     def done():
         x = xs[best]
-        limited = bool(np.any(np.abs(x) >= LIMIT - 0.5)) and errors[best] >= tolerance
+        limited = bool(np.any(np.abs(x) >= limit - 0.5)) and errors[best] >= tolerance
         return LookProposal(_offsets(x, vars_), True, errors[-1], errors[best], iterations, limited)
 
     if not vars_ or errors[-1] < tolerance or iterations >= max_iterations:
@@ -373,7 +378,7 @@ def propose_look(ref, history, plan, tolerance=1.0, max_iterations=4):
     lhs = J.T @ W @ J + REGULARIZE * np.eye(len(vars_)) + 1e-4 * np.diag(np.diag(J.T @ W @ J))
     rhs = -J.T @ W @ rs[-1] - REGULARIZE * xs[-1]
     dx = np.clip(np.linalg.solve(lhs, rhs), -STEP_CAP, STEP_CAP)
-    x_next = _limit(xs[-1] + dx, vars_)
+    x_next = _limit(xs[-1] + dx, vars_, limit, split_limit)
     if np.abs(x_next - xs[-1]).max() < 0.5:
         return done()
     return LookProposal(_offsets(x_next, vars_), False, errors[-1], errors[best], iterations)
@@ -402,7 +407,7 @@ def is_baked(creative):
     return not curve or list(curve) in ([0, 0, 255, 255], [0.0, 0.0, 255.0, 255.0])
 
 
-def to_settings(offsets, creative):
+def to_settings(offsets, creative, split_limit=SPLIT_LIMIT):
     """Look offsets -> Lightroom settings, added to the reference's own values."""
     out = {}
     for key, value in offsets.items():
@@ -414,7 +419,7 @@ def to_settings(offsets, creative):
         if f"{name}_a" in offsets:
             sa, sb = offsets[f"{name}_a"], offsets[f"{name}_b"]
             sat = float(np.hypot(sa, sb))
-            out[f"SplitToning{cap}Saturation"] = float(round(min(sat, SPLIT_LIMIT)))
+            out[f"SplitToning{cap}Saturation"] = float(round(min(sat, split_limit)))
             out[f"SplitToning{cap}Hue"] = float(round(lab_hue_to_hsv(np.degrees(np.arctan2(sb, sa))))) % 360 if sat > 0 else 0.0
     return out
 

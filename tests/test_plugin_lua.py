@@ -61,7 +61,9 @@ local photos, byId = {}, {}
 local function makePhoto(id, name, fmt, settings)
   local p = { localIdentifier = id, settings = settings, label = nil, snapshots = {} }
   function p:getRawMetadata(k)
-    if k == "fileFormat" then return fmt elseif k == "isVideo" then return false end
+    if k == "fileFormat" then return fmt elseif k == "isVideo" then return false
+    elseif k == "dateTimeOriginal" then return 750000000 + self.localIdentifier
+    elseif k == "dimensions" then return { width = 4032, height = 3024 } end
   end
   function p:getFormattedMetadata(k)
     if k == "fileName" then return name elseif k == "cameraModel" then return "Sony A7 IV" end
@@ -270,6 +272,7 @@ def test_bridge_commands_end_to_end(lua_env, tmp_path):
     assert [p["id"] for p in sel["photos"]] == ["11", "12"]
     a = sel["photos"][0]
     assert a["fileName"] == "A.ARW" and a["fileFormat"] == "RAW"
+    assert a["captureTime"] == 750000011 and a["dimensions"] == {"width": 4032, "height": 3024}
     assert a["settings"]["ToneCurvePV2012"] == [0, 0, 255, 255]
 
     b = by_id[12]

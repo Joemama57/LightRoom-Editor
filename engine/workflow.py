@@ -20,10 +20,14 @@ also learns automatically from every run.
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 from . import contact_sheet
 from . import look as look_stage
@@ -31,7 +35,8 @@ from . import skin as skin_model
 from .bridge import Bridge, BridgeError
 from .guards import MOSTLY_CLIPPED, different_scene, flags_for
 from .learning import Learner, light_bucket
-from .measure import Metrics, measure_file
+from .colorspace import delta_e_2000, srgb_to_lab
+from .measure import Metrics, load_image, measure_file
 from .settings import is_raw, split, starting_corrective
 from .solver import CORRECTIVE, MIN_SKIN_FRACTION, Options, at_tone_limit, blend, clamp, match_error, propose, wb_limits
 
@@ -39,9 +44,22 @@ RUNS_DIR = Path.home() / ".matchlook" / "runs"
 SNAPSHOT_NAME = "Before Match Look"
 REVIEW_FLAGS = {"not_converged", "mostly_clipped", "low_neutral_confidence", "different_scene", "tone_limited",
                 "look_limited"}
+# Per-photo look stage (fallback when a baked reference's original isn't selected).
+# Conservative: photos show different things, so only colour, only small moves.
 LOOK_TOLERANCE = 0.5
-LOOK_LIGHT_TOLERANCE = 0.5  # fraction of the light tolerance to aim for before the look stage
+LOOK_LIGHT_TOLERANCE = 0.5  # fraction of the light tolerance to aim for before it
 LOOK_ITERATIONS = 4
+PER_PHOTO_LOOK_LIMIT = 12.0
+SUBTITLE_CHARS = 58  # what fits under one contact-sheet tile
+PER_PHOTO_BAND_RATIO = 2.0
+# Grade fit on the reference's original (same pixels, so it can move further).
+GRADE_LIGHT_ITERATIONS = 8
+GRADE_LOOK_ITERATIONS = 8
+GRADE_LIMIT = 60.0
+GRADE_SPLIT_LIMIT = 40.0
+GRADE_TOLERANCE = 0.3
+# Suffixes editors and exports add to a file name: "IMG_1964 copy", "DSC1-Edit", ...
+EXPORT_SUFFIX = re.compile(r"([ _-]+(copy|edit|edited|export|final)( ?\d+)?|[ _-]\d{1,2})+$", re.IGNORECASE)
 
 
 def _corrective_settings(sliders):
@@ -130,15 +148,23 @@ def run_match(
     log=print,
     look=True,
     look_strength=1.0,
+    look_per_photo=False,
+    original=None,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
     skin: also keep skin tones consistent (engine/skin.py).
     color_only: solve white balance only; keep each photo's own exposure/tone.
     learner: engine.learning.Learner (self-learning); None disables learning.
-    look: also match the look from pixels (contrast, curve, saturation, HSL,
-        split toning; engine/look.py) after the light is matched.
-    look_strength: 0..1, how much of the solved look offsets to apply.
+    look: when the reference is an exported JPEG with its edit baked in (no
+        creative settings to copy), recover the edit by fitting Lightroom
+        settings that turn its unedited original into it (fit_grade), then
+        copy that grade to every photo. Without the original selected, fall
+        back to a small per-photo colour match (engine/look.py).
+    look_strength: 0..1, how much of the fitted look to apply.
+    look_per_photo: force the per-photo colour match.
+    original: file name of the reference's unedited original (default: found
+        by name among the selected photos).
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -174,6 +200,22 @@ def run_match(
     if snap.get("warning"):
         warnings.append(snap["warning"])
         log(f"Warning: {snap['warning']}")
+
+    baked = look and look_stage.is_baked(creative)
+    grade_fit = None
+    if baked:
+        source = find_original(ref, targets, original)
+        if source:
+            log(f"Reference looks exported from another editor; learning its grade from the original {source['fileName']}")
+            creative, grade_fit = fit_grade(bridge, ref, source, creative, ref_corrective, ref_metrics, ref_path,
+                                            out_dir, size, look_strength, warnings, log)
+        else:
+            look_per_photo = True
+            msg = ("Couldn't find the unedited original of the reference among the selected photos; matching colour "
+                   "conservatively. Select the original too for an exact match.")
+            warnings.append(msg)
+            log(msg)
+    per_photo_look = look and look_per_photo
 
     state = {}
     for t in targets:
@@ -229,7 +271,7 @@ def run_match(
             # With the look stage on, settle the light more tightly first: a
             # leftover cast would otherwise be "fixed" with HSL instead of white balance.
             p = propose(ref_metrics, s["history"], is_raw=s["is_raw"],
-                        tolerance=tolerance * LOOK_LIGHT_TOLERANCE if look else tolerance,
+                        tolerance=tolerance * LOOK_LIGHT_TOLERANCE if per_photo_look else tolerance,
                         max_iterations=max_iterations, options=s["options"])
             s["proposal"] = p
             if p.done:
@@ -272,11 +314,8 @@ def run_match(
             state[item["id"]]["preview"] = item["path"]
             state[item["id"]]["final_metrics"] = measure_file(item["path"], hint)
 
-    baked = look and look_stage.is_baked(creative)
-    if look:
-        if baked:
-            log("Reference looks pre-edited (no creative settings): matching its look from its pixels")
-        _match_look(bridge, state, creative, ref_path, out_dir, size, color_only, look_strength, warnings, log, hint)
+    if per_photo_look:
+        _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint)
 
     for s in state.values():
         o = s["options"]
@@ -304,7 +343,8 @@ def run_match(
         "tolerance": tolerance,
         "size": size,
         "options": {"skin": skin, "color_only": color_only, "learning": learner is not None,
-                    "look": look, "look_strength": look_strength},
+                    "look": look, "look_strength": look_strength, "look_per_photo": per_photo_look},
+        "grade_fit": grade_fit,
         "baked_reference": bool(baked),
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
         "warnings": warnings,
@@ -345,19 +385,134 @@ def run_match(
     return report
 
 
-def _match_look(bridge, state, creative, ref_path, out_dir, size, color_only, look_strength, warnings, log, hint):
-    """Second stage: per-photo creative offsets so each photo looks like the
-    reference, not just has its neutrals and brightness (engine/look.py)."""
+def _stem(name):
+    stem = Path(name or "").stem.strip()
+    return EXPORT_SUFFIX.sub("", stem).strip().lower()
+
+
+def find_original(ref, photos, name=None):
+    """The unedited original of an exported reference among `photos`, or None.
+
+    name: the original's file name or stem, if given explicitly. Otherwise a
+    photo whose name is the reference's without an export suffix
+    ("IMG_1964 copy.jpg" -> "IMG_1964.JPG"); capture time breaks ties."""
+    if name:
+        wanted = Path(name).stem.lower()
+        found = [p for p in photos if Path(p.get("fileName") or "").stem.lower() == wanted or p.get("fileName") == name]
+        if not found:
+            raise ValueError(f"--original {name} isn't among the selected photos")
+        return found[0]
+    stem = _stem(ref.get("fileName"))
+    if not stem or stem == Path(ref.get("fileName") or "").stem.lower():
+        # The reference's name has no export suffix: it is not a copy of anything.
+        same = []
+    else:
+        same = [p for p in photos if Path(p.get("fileName") or "").stem.lower() == stem]
+    if not same:
+        same = [p for p in photos if _stem(p.get("fileName")) == stem and p.get("fileName") != ref.get("fileName")]
+    if len(same) > 1 and ref.get("captureTime") is not None:
+        timed = [p for p in same if p.get("captureTime") == ref.get("captureTime")]
+        same = timed or same
+    return same[0] if same else None
+
+
+def pixel_delta_e(path_a, path_b, max_aspect_diff=0.02):
+    """Mean CIEDE2000 between two renders of the same picture, pixel by pixel
+    (None when they aren't the same framing)."""
+    a, b = load_image(path_a), load_image(path_b)
+    ra, rb = a.shape[1] / a.shape[0], b.shape[1] / b.shape[0]
+    if abs(ra - rb) / ra > max_aspect_diff:
+        return None
+    if b.shape[:2] != a.shape[:2]:
+        b = np.asarray(Image.fromarray((b * 255).round().astype(np.uint8)).resize((a.shape[1], a.shape[0]),
+                                                                                   Image.LANCZOS), float) / 255
+    la, lb = srgb_to_lab(a[::2, ::2].reshape(-1, 3)), srgb_to_lab(b[::2, ::2].reshape(-1, 3))
+    return float(np.mean(delta_e_2000(la, lb)))
+
+
+def fit_grade(bridge, ref, original, creative, ref_corrective, ref_metrics, ref_path, out_dir, size,
+              look_strength, warnings, log):
+    """Recover the edit baked into an exported reference from its unedited original.
+
+    Same pixels on both sides, so any difference is the grade: first the light
+    (white balance, exposure, tone) as for any photo, then the look sliders
+    (contrast, curve, saturation, HSL, split toning). Returns the creative
+    settings to copy to every photo, and a summary for the report."""
+    fit_dir = out_dir / "grade_fit"
+    fit_dir.mkdir(exist_ok=True)
+    oid, o_raw = original["id"], is_raw(original)
+    hint = (ref_metrics.a, ref_metrics.b)
+    start, wb_from_camera = starting_corrective(ref_corrective, is_raw(ref), o_raw, original.get("settings"))
+    options = Options(wb_limits=wb_limits(o_raw, wb_from_camera))
+
+    def render(tag, settings=None):
+        if settings:
+            _apply(bridge, [{"id": oid, "settings": settings}], warnings, log)
+        path = fit_dir / f"{tag}.jpg"
+        bridge.render([{"id": oid, "path": str(path)}], size=size)
+        return path
+
+    # 1. Light.
+    sliders, history = start, []
+    path = render("light_0", {**creative, **_corrective_settings(start)})
+    for i in range(1, GRADE_LIGHT_ITERATIONS + 2):
+        history.append({"sliders": sliders, "metrics": measure_file(path, hint).to_dict()})
+        p = propose(ref_metrics, history, is_raw=o_raw, tolerance=1.0, max_iterations=GRADE_LIGHT_ITERATIONS,
+                    options=options)
+        if p.done:
+            break
+        sliders = p.sliders
+        path = render(f"light_{i}", _corrective_settings(sliders))
+    light = p.sliders
+    lit = render("light_best", _corrective_settings(light))
+    delta_before = pixel_delta_e(ref_path, fit_dir / "light_0.jpg")
+    log(f"Grade fit: light matched (error {p.best_residual:.1f}); now contrast and colour")
+
+    # 2. Look.
     ref_look = look_stage.measure_look_file(ref_path)
-    split = not look_stage.has_split_toning(creative)
+    cur, masks = look_stage.measure_look_file_with_masks(lit)
+    plan = look_stage.make_plan(ref_look, cur, tone=True, split=not look_stage.has_split_toning(creative))
+    look_history = [{"offsets": {}, "look": cur}]
+    for i in range(1, GRADE_LOOK_ITERATIONS + 2):
+        q = look_stage.propose_look(ref_look, look_history, plan, tolerance=GRADE_TOLERANCE,
+                                    max_iterations=GRADE_LOOK_ITERATIONS, limit=GRADE_LIMIT,
+                                    split_limit=GRADE_SPLIT_LIMIT)
+        if q.done:
+            break
+        path = render(f"look_{i}", look_stage.to_settings(q.offsets, creative, GRADE_SPLIT_LIMIT))
+        look_history.append({"offsets": q.offsets, "look": look_stage.measure_look_file(path, masks)})
+    offsets = {k: float(round(v * look_strength)) for k, v in q.offsets.items()}
+    look_settings = look_stage.to_settings(offsets, creative, GRADE_SPLIT_LIMIT)
+    fitted = render("fitted", look_settings) if look_settings else lit
+    delta_after = pixel_delta_e(ref_path, fitted)
+    if delta_after is not None:
+        log(f"Grade fit: {delta_before:.1f} -> {delta_after:.1f} ΔE from the reference")
+    return {**creative, **look_settings}, {
+        "original": original["fileName"],
+        "delta_e_before": None if delta_before is None else round(delta_before, 2),
+        "delta_e_after": None if delta_after is None else round(delta_after, 2),
+        "look_error": round(q.best_error, 2),
+        "look_settings": look_settings,
+        "note": look_stage.describe(offsets) or None,
+        "light": light,
+        "preview": str(fitted),
+    }
+
+
+def _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint):
+    """Per-photo colour match (fallback): small creative offsets per photo
+    toward the reference's colour families (engine/look.py). Photos show
+    different things, so it stays conservative: no tone (the light stage owns
+    it), no split toning, only bands both photos share in similar amounts."""
+    ref_look = look_stage.measure_look_file(ref_path)
     for s in state.values():
         cur, s["look_masks"] = look_stage.measure_look_file_with_masks(s["preview"])
         # A blown-out frame has nothing to match; a different kind of scene
         # keeps its own brightness, so only its colour is refined.
         skip = s["final_metrics"].clipped_fraction > MOSTLY_CLIPPED
-        tone = not (color_only or s["options"].color_only)
         s["look_plan"] = (look_stage.Plan(tone=False, enabled=False) if skip else
-                          look_stage.make_plan(ref_look, cur, tone=tone, split=split, skin=s["options"].skin))
+                          look_stage.make_plan(ref_look, cur, tone=False, split=False, skin=s["options"].skin,
+                                               max_ratio=PER_PHOTO_BAND_RATIO))
         s["look_history"] = [{"offsets": {}, "look": cur, "preview": s["preview"],
                               "metrics": s["final_metrics"]}]
         s["look_done"] = False
@@ -368,8 +523,8 @@ def _match_look(bridge, state, creative, ref_path, out_dir, size, color_only, lo
         for pid, s in state.items():
             if s["look_done"]:
                 continue
-            p = look_stage.propose_look(ref_look, s["look_history"], s["look_plan"],
-                                        tolerance=LOOK_TOLERANCE, max_iterations=LOOK_ITERATIONS)
+            p = look_stage.propose_look(ref_look, s["look_history"], s["look_plan"], tolerance=LOOK_TOLERANCE,
+                                        max_iterations=LOOK_ITERATIONS, limit=PER_PHOTO_LOOK_LIMIT)
             s["look_proposal"] = p
             if p.done:
                 s["look_done"] = True
@@ -442,11 +597,15 @@ def _safe(photo):
 def _tiles(report, key):
     tiles = [{"path": report["reference"]["preview"], "title": f"REFERENCE · {report['reference']['fileName']}",
               "subtitle": "the look to match"}]
+    fit = report.get("grade_fit")
+    if fit and fit.get("delta_e_after") is not None and key == "preview":
+        tiles[0]["subtitle"] = f"grade learned from {fit['original']} (off by {fit['delta_e_after']:.1f})"
     for p in report["photos"]:
         err = p["start_error"] if key == "start_preview" else p["final_error"]
         flags = [f for f in p["flags"] if key == "preview" or f not in REVIEW_FLAGS]
         notes = list(flags)
-        if key == "preview" and p.get("skin_vs_reference") and p["skin_vs_reference"] != "matches the reference":
+        skin_on = report.get("options", {}).get("skin")
+        if key == "preview" and skin_on and p.get("skin_vs_reference") and p["skin_vs_reference"] != "matches the reference":
             notes.append(f"skin {p['skin_vs_reference']}")
         if key == "preview" and p.get("learned_adjustment"):
             notes.append("learned adj.")
@@ -456,10 +615,22 @@ def _tiles(report, key):
         tiles.append({
             "path": p[key],
             "title": p["fileName"],
-            "subtitle": f"error {err:.1f}" + (f" · {', '.join(notes)}" if notes else ""),
+            "subtitle": _subtitle(f"error {err:.1f}", notes),
             "highlight": key == "preview" and bool(REVIEW_FLAGS & set(p["flags"])),
         })
     return tiles
+
+
+def _subtitle(head, notes, width=SUBTITLE_CHARS):
+    """'error 1.2 · flag, flag' cut to fit one tile, with '+N more'."""
+    text = head
+    for i, note in enumerate(notes):
+        more = len(notes) - i - 1
+        candidate = f"{text}{' · ' if text == head else ', '}{note}"
+        if len(candidate) + (len(f" +{more} more") if more else 0) > width:
+            return f"{text} +{len(notes) - i} more"
+        text = candidate
+    return text
 
 
 def _write_outputs(out_dir, report):
@@ -674,6 +845,9 @@ def main(argv=None):
     m.add_argument("--no-look", action="store_true",
                    help="match light only (white balance, exposure, tone); skip matching colour and contrast")
     m.add_argument("--look-strength", type=float, default=1.0, help="0..1, how much of the look matching to apply")
+    m.add_argument("--look-per-photo", action="store_true",
+                   help="also nudge each photo's colours toward the reference's (small, per photo)")
+    m.add_argument("--original", help="file name of the reference's unedited original, if not found by name")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -704,7 +878,8 @@ def main(argv=None):
                                max_iterations=args.max_iterations, size=args.size, label=args.label,
                                skin=args.skin, color_only=args.color_only, learner=learner,
                                runs_dir=RUNS_DIR if not args.out else None, log=log,
-                               look=not args.no_look, look_strength=args.look_strength)
+                               look=not args.no_look, look_strength=args.look_strength,
+                               look_per_photo=args.look_per_photo, original=args.original)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             p = run_nudge(bridge, args.run, args.photo, parse_changes(args.changes, allow_mask=bool(args.mask)),
@@ -729,17 +904,22 @@ def main(argv=None):
 
 
 def _summary(report):
+    # Skin notes only when asked for: on photos without people, orange paint
+    # or a brick wall reads as "skin" and the notes are noise.
+    skin_on = report.get("options", {}).get("skin")
     return {
         "reference": report["reference"]["fileName"],
         "baked_reference": report.get("baked_reference"),
-        "reference_skin": report["reference"].get("skin"),
+        "grade_fit": {k: v for k, v in (report.get("grade_fit") or {}).items() if k not in ("look_settings", "light")}
+        or None,
+        "reference_skin": report["reference"].get("skin") if skin_on else None,
         "contact_sheet": report["contact_sheet"],
         "contact_sheet_before": report["contact_sheet_before"],
         "warnings": report["warnings"],
         "photos": [
             {k: p.get(k) for k in ("fileName", "start_error", "final_error", "look_start_error", "look_final_error",
-                                   "look_note", "iterations", "flags", "final", "learned_adjustment",
-                                   "skin_vs_reference")}
+                                   "look_note", "iterations", "flags", "final", "learned_adjustment")
+             + (("skin_vs_reference",) if skin_on else ())}
             for p in report["photos"]
         ],
     }

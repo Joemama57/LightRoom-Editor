@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 from engine import look
-from engine.colorspace import srgb_to_linear
-from engine.workflow import run_match
+from engine.colorspace import delta_e_2000, srgb_to_lab, srgb_to_linear
+from engine.workflow import find_original, run_match
 from tests.fake_lightroom import FakeLightroom
 from tests.simulator import capture, make_scene, render
 
@@ -50,35 +50,82 @@ def test_split_toning_hue_conversion_round_trips():
         assert look.lab_hue_to_hsv(look.hsv_hue_to_lab(h)) == pytest.approx(h, abs=0.5)
 
 
-@pytest.fixture
-def baked_set():
-    ref_raw = baked(capture(sky_scene(0), 5500), BAKED_LOOK)
-    return FakeLightroom({
-        "ref": photo(ref_raw, "IMG_1964 copy.jpg"),
+def scenes():
+    return {
         "warm": photo(capture(sky_scene(1)[4:, 2:], 5000, 0, -0.3), "IMG_1961.JPG"),
-        "cool": photo(capture(sky_scene(2)[2:, 4:], 6800, 3, 0.2), "IMG_1966.JPG"),
+        "cool": photo(capture(sky_scene(2)[2:, 4:], 6200, 3, 0.2), "IMG_1966.JPG"),
+    }
+
+
+@pytest.fixture
+def pair_set():
+    """An exported, edited reference plus its unedited original in the selection."""
+    original = capture(sky_scene(0), 5500)
+    return FakeLightroom({
+        "ref": photo(baked(original, BAKED_LOOK), "IMG_1964 copy.jpg"),
+        "orig": photo(original, "IMG_1964.JPG"),
+        **scenes(),
     }, active="ref")
 
 
-def test_baked_reference_look_is_matched_from_pixels(baked_set, tmp_path):
-    report = run_match(baked_set, tmp_path, log=quiet)
-    assert report["baked_reference"]
-    ref_look = look.measure_look(render(baked_set.photos["ref"]["raw"], {}))
+def test_grade_is_learned_from_the_original_and_shared(pair_set, tmp_path):
+    report = run_match(pair_set, tmp_path, log=quiet)
+    fit = report["grade_fit"]
+    assert report["baked_reference"] and fit["original"] == "IMG_1964.JPG"
+    assert fit["delta_e_after"] < fit["delta_e_before"] / 2 and fit["delta_e_after"] < 1.0, fit
+    g = fit["look_settings"]
+    # Several slider mixes give the same look; what matters is that the fitted
+    # grade does to a different scene what the real edit would have done.
+    for scene in (sky_scene(3)[6:, :], sky_scene(4, sky=False)):
+        raw = capture(scene, 5500)
+        truth = srgb_to_lab(render(raw, BAKED_LOOK).reshape(-1, 3))
+        fitted = delta_e_2000(truth, srgb_to_lab(render(raw, g).reshape(-1, 3))).mean()
+        unedited = delta_e_2000(truth, srgb_to_lab(render(raw, {}).reshape(-1, 3))).mean()
+        assert fitted < unedited / 1.8, (fitted, unedited)
+    # One look for every photo; only the light differs.
+    looks = [{k: v for k, v in pair_set.photos[pid]["settings"].items() if k in look.LOOK_KEYS}
+             for pid in ("orig", "warm", "cool")]
+    assert looks[0] == looks[1] == looks[2] == g
     for p in report["photos"]:
-        assert p["look_final_error"] < p["look_start_error"] / 2, p
-        assert p["look_final_error"] < 1.5, p
-        assert p["look_settings"].get("SaturationAdjustmentBlue", 0) > 5  # the sky got the reference's blue
-        final = look.measure_look_file(p["preview"])
-        assert final["bands"]["Blue"]["c"] == pytest.approx(ref_look["bands"]["Blue"]["c"], abs=2.5)
-        assert "look_limited" not in p["flags"]
-        assert p["look_note"]
+        assert p["final_error"] < 2.0, p
+        assert p["look_settings"] == {}  # no per-photo look stage
+    assert not report["options"]["look_per_photo"]
 
 
-def test_no_look_keeps_todays_behaviour(baked_set, tmp_path):
-    report = run_match(baked_set, tmp_path, look=False, log=quiet)
+def test_original_named_explicitly(pair_set, tmp_path):
+    pair_set.photos["orig"]["fileName"] = "unrelated_name.JPG"
+    report = run_match(pair_set, tmp_path, original="unrelated_name", log=quiet)
+    assert report["grade_fit"]["original"] == "unrelated_name.JPG"
+
+
+def test_find_original_by_name():
+    photos = [{"fileName": "IMG_1964.JPG"}, {"fileName": "DSC1.ARW"}, {"fileName": "IMG_1965.JPG"}]
+    assert find_original({"fileName": "IMG_1964 copy.jpg"}, photos)["fileName"] == "IMG_1964.JPG"
+    assert find_original({"fileName": "IMG_1964 copy 2.jpg"}, photos)["fileName"] == "IMG_1964.JPG"
+    assert find_original({"fileName": "DSC1-Edit.tif"}, photos)["fileName"] == "DSC1.ARW"
+    assert find_original({"fileName": "IMG_9999 copy.jpg"}, photos) is None
+    assert find_original({"fileName": "IMG_1965.JPG"}, photos[:2]) is None  # not a copy of anything
+
+
+def test_without_the_original_colour_is_matched_conservatively(tmp_path):
+    lr = FakeLightroom({"ref": photo(baked(capture(sky_scene(0), 5500), BAKED_LOOK), "IMG_1964 copy.jpg"),
+                        **scenes()}, active="ref")
+    report = run_match(lr, tmp_path, log=quiet)
+    assert report["grade_fit"] is None and report["options"]["look_per_photo"]
+    assert any("original" in w for w in report["warnings"])
+    for p in report["photos"]:
+        assert p["look_final_error"] <= p["look_start_error"] + 1e-9
+        assert all(abs(v) <= 12.05 for k, v in p["look_settings"].items())
+        assert not any(k in look.TONE_KEYS or k.startswith("SplitToning") for k in p["look_settings"])
+        assert p["final_error"] < 2.0, p
+
+
+def test_no_look_keeps_light_only(pair_set, tmp_path):
+    report = run_match(pair_set, tmp_path, look=False, log=quiet)
+    assert report["grade_fit"] is None
     for p in report["photos"]:
         assert p["look_settings"] == {} and p["look_final_error"] is None
-        assert not any(k in baked_set.photos[p["id"]]["settings"] for k in look.LOOK_KEYS)
+        assert not any(k in pair_set.photos[p["id"]]["settings"] for k in look.LOOK_KEYS)
 
 
 def test_band_missing_from_a_photo_is_left_alone(tmp_path):
@@ -86,7 +133,7 @@ def test_band_missing_from_a_photo_is_left_alone(tmp_path):
     bluish = closeup[..., 2] > closeup[..., 0] * 1.5
     closeup[bluish] = closeup[bluish].mean(axis=-1, keepdims=True)  # no sky, no blue anything
     lr = FakeLightroom({
-        "ref": photo(baked(capture(sky_scene(0), 5500), BAKED_LOOK), "ref.jpg"),
+        "ref": photo(baked(capture(sky_scene(0), 5500), BAKED_LOOK), "ref copy.jpg"),
         "closeup": photo(capture(closeup, 5200), "closeup.JPG"),
     }, active="ref")
     report = run_match(lr, tmp_path, log=quiet)
@@ -94,20 +141,19 @@ def test_band_missing_from_a_photo_is_left_alone(tmp_path):
     assert not any(k.endswith("Blue") for k in p["look_settings"])
 
 
-def test_offsets_are_limited_and_flagged(tmp_path):
-    extreme = {"SaturationAdjustmentBlue": 100, "SaturationAdjustmentAqua": 100, "Saturation": 60}
-    lr = FakeLightroom({
-        "ref": photo(baked(capture(sky_scene(0), 5500), extreme), "ref.jpg"),
-        "t": photo(capture(sky_scene(1)[4:, 2:], 5500), "t.JPG"),
-    }, active="ref")
-    report = run_match(lr, tmp_path, log=quiet)
-    (p,) = report["photos"]
-    assert all(abs(v) <= look.LIMIT + 0.05 for k, v in p["look_settings"].items() if not k.startswith("SplitToning"))
-    assert "look_limited" in p["flags"]
-    assert lr.labels == {"t": "yellow"}
-
-
 def test_reference_edited_in_lightroom_is_not_baked():
     assert look.is_baked({"ProcessVersion": "11.0", "CameraProfile": "Adobe Standard"})
     assert not look.is_baked({"SaturationAdjustmentBlue": 10})
     assert not look.is_baked({"ToneCurvePV2012": [0, 10, 128, 140, 255, 255]})
+
+
+def test_contact_sheet_notes_stay_short_and_skip_skin_unless_asked():
+    from engine.workflow import _subtitle, _tiles
+    text = _subtitle("error 9.9", ["not_converged", "look_limited", "different_file_type", "tone_limited"])
+    assert len(text) <= 58 and text.endswith("more")
+    report = {"options": {"skin": False}, "reference": {"preview": "r.jpg", "fileName": "r.jpg"},
+              "photos": [{"fileName": "a.jpg", "preview": "a.jpg", "start_preview": "a0.jpg", "start_error": 3.0,
+                          "final_error": 1.0, "flags": [], "skin_vs_reference": "greener"}]}
+    assert "skin" not in _tiles(report, "preview")[1]["subtitle"]
+    report["options"]["skin"] = True
+    assert "skin greener" in _tiles(report, "preview")[1]["subtitle"]

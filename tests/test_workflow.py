@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from engine import look
 from engine.settings import split, starting_corrective
 from engine.workflow import parse_changes, run_match, run_nudge
 from tests.fake_lightroom import FakeLightroom
@@ -97,11 +96,7 @@ def test_match_end_to_end(lightroom, tmp_path):
     for pid in ("tung", "shade", "under"):
         s = lightroom.photos[pid]["settings"]
         for key, value in LOOK.items():
-            if key in look.LOOK_KEYS:
-                # The look stage may add a small per-photo offset on top.
-                assert abs(s[key] - value) <= look.LIMIT + 1e-6 or key.endswith("Hue")
-            else:
-                assert s[key] == value
+            assert s[key] == value  # edited in Lightroom: the look is copied exactly
         assert s["CropTop"] == 0.0 and s["Sharpness"] == 25
         assert s["WhiteBalance"] == "Custom"
 

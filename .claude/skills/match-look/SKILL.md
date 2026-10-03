@@ -40,7 +40,10 @@ Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can
 - **Strength:** a number from 0 to 100 becomes `--strength N/100`. The default is 1.0.
 - **`--skin`** if people are in the photos, or the user says skin/portrait. This keeps skin tones consistent using a model built from measured skin colour (`docs/SKIN_TONES.md`).
 - **`--color-only`** if the user wants each photo to keep its own brightness (a deliberately dark or bright frame, a mood sequence), or says "just the colour". Don't use it for ordinary sets such as exteriors in daylight: it also stops contrast from being matched.
-- **Look matching is on by default.** After the light, it matches what the eye sees: contrast and tone curve, saturation, each colour family (sky blue, oranges…) and the shadow/highlight tint. It does this with small per-photo offsets on top of the reference's look. It also works when the reference is an exported JPEG with its edit baked in (`baked_reference: true` in the summary). Use `--look-strength 0.5` for a gentler match. Use `--no-look` only if the user wants white balance and exposure only.
+- **A reference exported from another editor** (for example `IMG_1964 copy.jpg`, with its edit baked into the pixels and no Lightroom settings to copy) needs its **unedited original selected too**. The engine finds it by name (`IMG_1964.JPG`). It learns the grade by fitting Lightroom settings that turn the original into the copy, then applies that **same** grade to every photo and solves only each photo's light.
+  - If the reference's name doesn't make the original obvious, pass `--original FILE_NAME`.
+  - If the summary has a warning that the original wasn't found, tell the user to select the original too and re-run. Without it, only a small, conservative per-photo colour match is possible.
+  - `--look-strength 0.5` applies half of the learned grade. `--no-look` skips it.
 - **Learning is on by default.** Each run:
   - first learns from any edits the user made to the previous run's photos;
   - starts from the slider response learned on this camera;
@@ -59,8 +62,8 @@ It writes the look and the solved sliders into Lightroom. It takes a "Before Mat
 - for each photo:
   - `start_error`: how far off it was with the look only pasted
   - `final_error`: how far off its light (neutrals and brightness) is after matching (under 2 is a good match)
-  - `look_start_error` → `look_final_error`: how far off its look (contrast, saturation, colour families) was, and is. Under 1 is a close match.
-  - `look_note`: the biggest look changes, for example "blue sat +12, contrast +8"
+- `grade_fit` (only for an exported reference): `original`, `delta_e_before` → `delta_e_after` (how far the original is from the reference before and after fitting; under 3 means the grade was recovered well), and `note` (the biggest parts of the grade, for example "blue sat +20, contrast +15")
+- `look_start_error` → `look_final_error` and `look_note` per photo: only when the conservative per-photo colour match ran
   - `flags`
   - `learned_adjustment`: a learned preference that was applied, if any
   - `skin_vs_reference`
@@ -114,15 +117,16 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 - `different_scene`: a dark, coloured-light frame against a normally lit reference. Only its colour was matched; its brightness was left alone. Don't nudge it toward the reference; recommend matching it in a batch with a similar reference instead.
 - `tone_limited`: exposure or tone hit the safety limit (±2 EV, ±40 on the tone sliders) and still doesn't match, usually a content difference. Check it doesn't look too dark or flat before nudging.
 - Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
-- `look_limited`: a look slider hit its limit (±30 from the reference) and the photo still doesn't match. That usually means very different light or content (sunset versus midday, or a different white balance than JPEG limits allow). Check it before nudging.
+- `look_limited` (per-photo colour match only): a colour slider hit its limit and the photo still differs, usually because the content differs. Check it before nudging.
 - Never change photos outside this run. Don't change other creative settings such as profile, grain or vignette: those stay exactly the reference's.
 
 Every nudge you make, and every edit the user makes later in Lightroom, is learned from at the next run. You don't need to run anything extra. To learn right away, for example before closing, run `PY -m engine.workflow learn`.
 
 ## 5. Report
 Keep the report short:
-- **A table:** one row per photo with the file name, error before → after, look error before → after with the `look_note`, any learned adjustment applied, any nudge you made and why (for example "skin looked green, Tint +4"), and flags.
-- **Skin**, if present: one line on how consistent it is across the set. Use the report's words (for example "DSC0042: greener than the reference, fixed").
+- **A table:** one row per photo with the file name, error before → after, any learned adjustment applied, any nudge you made and why (for example "skin looked green, Tint +4"), and flags.
+- **Grade**, for an exported reference: one line from `grade_fit`, for example "learned the edit from IMG_1964.JPG: off by 1.2 after fitting; blue sat +20, contrast +15".
+- **Skin**, only with `--skin`: one line on how consistent it is across the set. Use the report's words (for example "DSC0042: greener than the reference, fixed").
 - **Flagged photos:** which photos have the yellow label, and why each needs the user's eye.
 - **What was learned:** one line, from `PY -m engine.learning show`. For example "learned from 2 edits you made last time; this camera's slider response now has 40 samples".
 - **How to undo:** the "Before Match Look" snapshot on each photo (Develop ▸ Snapshots), or Edit ▸ Undo. If the summary has a snapshot `warning`, say that undo is through the History panel instead.

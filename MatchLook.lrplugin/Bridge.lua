@@ -106,6 +106,9 @@ function commands.get_selection()
 					fileName = photo:getFormattedMetadata("fileName"),
 					fileFormat = photo:getRawMetadata("fileFormat"),
 					cameraModel = photo:getFormattedMetadata("cameraModel"),
+					-- Capture time and size help pair an exported copy with its original.
+					captureTime = photo:getRawMetadata("dateTimeOriginal"),
+					dimensions = photo:getRawMetadata("dimensions"),
 					settings = photo:getDevelopSettings(),
 				}
 			end
