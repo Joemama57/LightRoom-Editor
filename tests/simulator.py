@@ -3,11 +3,14 @@
 It is not Lightroom's math, but it has the same kinds of behavior the solver has
 to cope with: white balance as channel gains that depend on Kelvin/Tint,
 exposure in stops, and nonlinear, overlapping tone sliders, then clipping.
+The creative "look" sliders (contrast, parametric curve, vibrance/saturation,
+HSL bands, split toning) act in Lab, roughly the way Lightroom's do.
 """
 
 import numpy as np
 
-from engine.colorspace import linear_to_srgb
+from engine.colorspace import lab_to_srgb, linear_to_srgb, srgb_to_lab
+from engine import look
 
 
 def illuminant_gains(kelvin, tint=0.0):
@@ -64,7 +67,45 @@ def render(raw, sliders):
     v = v + 0.50 * shadows * v * (1 - v) ** 3
     v = v + 0.50 * highlights * v**3 * (1 - v)
     v = v + 0.12 * whites * v**6
-    return np.clip(v, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+    if any(sliders.get(k) for k in look.LOOK_KEYS):
+        v = _render_look(v, sliders)
+    return v
+
+
+PARAMETRIC_CENTERS = {"ParametricShadows": 12, "ParametricDarks": 35, "ParametricLights": 65, "ParametricHighlights": 88}
+
+
+def _render_look(v, sliders):
+    shape = v.shape
+    rgb = v.reshape(-1, 3)
+    lab = srgb_to_lab(rgb)
+    L, a, b = lab[:, 0], lab[:, 1], lab[:, 2]
+    c, h = np.hypot(a, b), np.degrees(np.arctan2(b, a))
+
+    k = sliders.get("Contrast2012", 0.0) / 100
+    x = (L - 50) / 50
+    L = L + 0.25 * k * (L - 50) * np.clip(1 - x**2, 0, 1)
+    for key, center in PARAMETRIC_CENTERS.items():
+        L = L + 0.12 * sliders.get(key, 0.0) * np.exp(-0.5 * ((L - center) / 14) ** 2)
+
+    factor = (1 + sliders.get("Vibrance", 0.0) / 100 * 0.8 * np.exp(-c / 40)) * (1 + sliders.get("Saturation", 0.0) / 100 * 0.6)
+    w = look.band_weights(look.hsv_hue(rgb)) * look.chroma_weight(c)[:, None]
+    hue_adj = np.array([sliders.get(f"HueAdjustment{n}", 0.0) for n in look.BANDS])
+    sat_adj = np.array([sliders.get(f"SaturationAdjustment{n}", 0.0) for n in look.BANDS])
+    lum_adj = np.array([sliders.get(f"LuminanceAdjustment{n}", 0.0) for n in look.BANDS])
+    h = h + 0.3 * (w @ hue_adj)
+    c = c * factor * (1 + 0.8 * (w @ sat_adj) / 100)
+    L = L + 0.15 * (w @ lum_adj)
+    a, b = c * np.cos(np.radians(h)), c * np.sin(np.radians(h))
+
+    for name, mask in (("Shadow", np.clip((50 - L) / 35, 0, 1)), ("Highlight", np.clip((L - 50) / 35, 0, 1))):
+        sat = sliders.get(f"SplitToning{name}Saturation", 0.0)
+        if sat:
+            angle = np.radians(look.hsv_hue_to_lab(sliders.get(f"SplitToning{name}Hue", 0.0)))
+            a = a + mask * 0.12 * sat * np.cos(angle)
+            b = b + mask * 0.12 * sat * np.sin(angle)
+    return lab_to_srgb(np.stack([np.clip(L, 0, 100), a, b], axis=-1)).reshape(shape)
 
 
 def run_loop(ref_metrics, raw, start_sliders, is_raw=True, **kwargs):

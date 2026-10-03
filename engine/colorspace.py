@@ -35,6 +35,18 @@ def srgb_to_lab(rgb):
     return np.stack([L, a, b], axis=-1)
 
 
+
+def lab_to_srgb(lab):
+    """Convert CIELAB (D65), shape (..., 3), to gamma-encoded sRGB clipped to [0, 1]."""
+    lab = np.asarray(lab, dtype=np.float64)
+    fy = (lab[..., 0] + 16) / 116
+    f = np.stack([fy + lab[..., 1] / 500, fy, fy - lab[..., 2] / 200], axis=-1)
+    d = 6 / 29
+    t = np.where(f > d, f**3, 3 * d**2 * (f - 4 / 29))
+    rgb = (t * _D65_WHITE) @ np.linalg.inv(_RGB_TO_XYZ).T
+    return linear_to_srgb(rgb)
+
+
 def delta_e_2000(lab1, lab2):
     """CIEDE2000 difference between Lab colors, shape (..., 3). Sharma et al. (2005)."""
     lab1 = np.asarray(lab1, dtype=np.float64)

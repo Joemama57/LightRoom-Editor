@@ -1,13 +1,14 @@
 """The full Match Look job, driven through the Lightroom bridge.
 
-    python3 -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-learning] [--out DIR]
+    python3 -m engine.workflow match [--strength 1.0] [--skin] [--color-only] [--no-look] [--no-learning] [--out DIR]
     python3 -m engine.workflow nudge --run DIR --photo NAME [--mask subject] Exposure2012=+0.2 Temperature=-150
     python3 -m engine.workflow learn [--run DIR]
     python3 -m engine.workflow calibrate
 
-`match` copies the active photo's look onto the other selected photos and
+`match` copies the active photo's look onto the other selected photos,
 solves each one's white balance / exposure / tone so it matches the active
-photo. It writes report.json, contact_sheet_before.jpg (look pasted, nothing
+photo, then matches the look itself from pixels (contrast, saturation, HSL,
+split toning; engine/look.py). It writes report.json, contact_sheet_before.jpg (look pasted, nothing
 solved) and contact_sheet.jpg (final) into the run folder.
 
 `nudge` makes a small relative change to one photo from a run, re-renders it
@@ -25,9 +26,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import contact_sheet
+from . import look as look_stage
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
-from .guards import different_scene, flags_for
+from .guards import MOSTLY_CLIPPED, different_scene, flags_for
 from .learning import Learner, light_bucket
 from .measure import Metrics, measure_file
 from .settings import is_raw, split, starting_corrective
@@ -35,7 +37,11 @@ from .solver import CORRECTIVE, MIN_SKIN_FRACTION, Options, at_tone_limit, blend
 
 RUNS_DIR = Path.home() / ".matchlook" / "runs"
 SNAPSHOT_NAME = "Before Match Look"
-REVIEW_FLAGS = {"not_converged", "mostly_clipped", "low_neutral_confidence", "different_scene", "tone_limited"}
+REVIEW_FLAGS = {"not_converged", "mostly_clipped", "low_neutral_confidence", "different_scene", "tone_limited",
+                "look_limited"}
+LOOK_TOLERANCE = 0.5
+LOOK_LIGHT_TOLERANCE = 0.5  # fraction of the light tolerance to aim for before the look stage
+LOOK_ITERATIONS = 4
 
 
 def _corrective_settings(sliders):
@@ -122,12 +128,17 @@ def run_match(
     learner=None,
     runs_dir=None,
     log=print,
+    look=True,
+    look_strength=1.0,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
     skin: also keep skin tones consistent (engine/skin.py).
     color_only: solve white balance only; keep each photo's own exposure/tone.
     learner: engine.learning.Learner (self-learning); None disables learning.
+    look: also match the look from pixels (contrast, curve, saturation, HSL,
+        split toning; engine/look.py) after the light is matched.
+    look_strength: 0..1, how much of the solved look offsets to apply.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -215,7 +226,10 @@ def run_match(
                 # bright exterior): match its colour, keep its own brightness.
                 s["options"] = replace(s["options"], color_only=True)
                 s["extra_flags"].append("different_scene")
-            p = propose(ref_metrics, s["history"], is_raw=s["is_raw"], tolerance=tolerance,
+            # With the look stage on, settle the light more tightly first: a
+            # leftover cast would otherwise be "fixed" with HSL instead of white balance.
+            p = propose(ref_metrics, s["history"], is_raw=s["is_raw"],
+                        tolerance=tolerance * LOOK_LIGHT_TOLERANCE if look else tolerance,
                         max_iterations=max_iterations, options=s["options"])
             s["proposal"] = p
             if p.done:
@@ -258,6 +272,12 @@ def run_match(
             state[item["id"]]["preview"] = item["path"]
             state[item["id"]]["final_metrics"] = measure_file(item["path"], hint)
 
+    baked = look and look_stage.is_baked(creative)
+    if look:
+        if baked:
+            log("Reference looks pre-edited (no creative settings): matching its look from its pixels")
+        _match_look(bridge, state, creative, ref_path, out_dir, size, color_only, look_strength, warnings, log, hint)
+
     for s in state.values():
         o = s["options"]
         s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only)
@@ -268,6 +288,8 @@ def run_match(
         unscaled = strength == 1.0 and not s["learned_adjustment"]
         if unscaled and s["final_error"] >= tolerance and "not_converged" not in s["flags"]:
             s["flags"].append("not_converged")
+        if s.get("look_limited"):
+            s["flags"].append("look_limited")
 
     if learner is not None:
         for s in state.values():
@@ -281,11 +303,14 @@ def run_match(
         "strength": strength,
         "tolerance": tolerance,
         "size": size,
-        "options": {"skin": skin, "color_only": color_only, "learning": learner is not None},
+        "options": {"skin": skin, "color_only": color_only, "learning": learner is not None,
+                    "look": look, "look_strength": look_strength},
+        "baked_reference": bool(baked),
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
         "warnings": warnings,
         "reference": {"id": ref_id, "fileName": ref["fileName"], "preview": str(ref_path),
-                      "metrics": ref_metrics.to_dict(), "skin": ref_skin},
+                      "metrics": ref_metrics.to_dict(), "skin": ref_skin,
+                      "creative_look": {k: creative[k] for k in look_stage.LOOK_KEYS if k in creative}},
         "photos": [],
     }
     for pid, s in state.items():
@@ -305,6 +330,10 @@ def run_match(
             "start_error": round(s["start_error"], 2),
             "final_error": round(s["final_error"], 2),
             "iterations": s["proposal"].iterations,
+            "look_start_error": s.get("look_start_error"),
+            "look_final_error": s.get("look_final_error"),
+            "look_settings": s.get("look_settings", {}),
+            "look_note": s.get("look_note"),
             "flags": s["flags"] + s["extra_flags"],
             "skin": t_skin,
             "skin_vs_reference": skin_model.compare(ref_skin, t_skin) if ref_skin and t_skin else None,
@@ -314,6 +343,87 @@ def run_match(
     _label_flagged(bridge, report, label)
     _write_outputs(out_dir, report)
     return report
+
+
+def _match_look(bridge, state, creative, ref_path, out_dir, size, color_only, look_strength, warnings, log, hint):
+    """Second stage: per-photo creative offsets so each photo looks like the
+    reference, not just has its neutrals and brightness (engine/look.py)."""
+    ref_look = look_stage.measure_look_file(ref_path)
+    split = not look_stage.has_split_toning(creative)
+    for s in state.values():
+        cur, s["look_masks"] = look_stage.measure_look_file_with_masks(s["preview"])
+        # A blown-out frame has nothing to match; a different kind of scene
+        # keeps its own brightness, so only its colour is refined.
+        skip = s["final_metrics"].clipped_fraction > MOSTLY_CLIPPED
+        tone = not (color_only or s["options"].color_only)
+        s["look_plan"] = (look_stage.Plan(tone=False, enabled=False) if skip else
+                          look_stage.make_plan(ref_look, cur, tone=tone, split=split, skin=s["options"].skin))
+        s["look_history"] = [{"offsets": {}, "look": cur, "preview": s["preview"],
+                              "metrics": s["final_metrics"]}]
+        s["look_done"] = False
+
+    iteration = 0
+    while True:
+        updates = []
+        for pid, s in state.items():
+            if s["look_done"]:
+                continue
+            p = look_stage.propose_look(ref_look, s["look_history"], s["look_plan"],
+                                        tolerance=LOOK_TOLERANCE, max_iterations=LOOK_ITERATIONS)
+            s["look_proposal"] = p
+            if p.done:
+                s["look_done"] = True
+            else:
+                s["look_offsets"] = p.offsets
+                updates.append({"id": pid, "settings": look_stage.to_settings(p.offsets, creative)})
+        if not updates:
+            break
+        log(f"Look pass {iteration + 1}: {len(updates)} photo(s) refining colour and contrast")
+        _apply(bridge, updates, warnings, log)
+        it_dir = out_dir / f"look_{iteration}"
+        it_dir.mkdir(exist_ok=True)
+        items = [{"id": u["id"], "path": str(it_dir / f"{_safe(state[u['id']]['photo'])}.jpg")} for u in updates]
+        bridge.render(items, size=size)
+        for item in items:
+            s = state[item["id"]]
+            s["look_history"].append({"offsets": s["look_offsets"],
+                                      "look": look_stage.measure_look_file(item["path"], s["look_masks"]),
+                                      "preview": item["path"], "metrics": measure_file(item["path"], hint)})
+        iteration += 1
+
+    finals, rerender = [], []
+    for pid, s in state.items():
+        p = s["look_proposal"]
+        offsets = {k: float(round(v * look_strength)) for k, v in p.offsets.items()}
+        settings = look_stage.to_settings(offsets, creative)
+        s["look_settings"] = settings
+        s["look_note"] = look_stage.describe(offsets) or None
+        s["look_limited"] = p.limited
+        s["look_start_error"] = round(look_stage.look_error(ref_look, s["look_history"][0]["look"], s["look_plan"]), 2)
+        best = next((h for h in s["look_history"] if _same_offsets(h["offsets"], offsets)), None)
+        if settings:
+            finals.append({"id": pid, "settings": settings})
+        if best is not None:
+            s["preview"], s["final_metrics"] = best["preview"], best["metrics"]
+            s["look_final_error"] = round(look_stage.look_error(ref_look, best["look"], s["look_plan"]), 2)
+        else:
+            rerender.append(pid)
+    if finals:
+        _apply(bridge, finals, warnings, log)
+    if rerender:
+        final_dir = out_dir / "look_final"
+        final_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(final_dir / f"{_safe(state[pid]['photo'])}.jpg")} for pid in rerender]
+        bridge.render(items, size=size)
+        for item in items:
+            s = state[item["id"]]
+            s["preview"], s["final_metrics"] = item["path"], measure_file(item["path"], hint)
+            s["look_final_error"] = round(look_stage.look_error(ref_look, look_stage.measure_look_file(item["path"], s["look_masks"]),
+                                                                s["look_plan"]), 2)
+
+
+def _same_offsets(a, b):
+    return all(abs(a.get(k, 0.0) - b.get(k, 0.0)) < 0.05 for k in set(a) | set(b))
 
 
 def _label_flagged(bridge, report, label):
@@ -340,6 +450,9 @@ def _tiles(report, key):
             notes.append(f"skin {p['skin_vs_reference']}")
         if key == "preview" and p.get("learned_adjustment"):
             notes.append("learned adj.")
+        look_err = p.get("look_start_error") if key == "start_preview" else p.get("look_final_error")
+        if look_err is not None:
+            notes.insert(0, f"look {look_err:.1f}")
         tiles.append({
             "path": p[key],
             "title": p["fileName"],
@@ -360,7 +473,7 @@ def _write_outputs(out_dir, report):
 
 def parse_changes(pairs, allow_mask=False):
     """["Exposure2012=+0.2", "Tint=-3"] -> {"Exposure2012": 0.2, "Tint": -3.0}"""
-    allowed = list(MASK_SLIDERS) if allow_mask else CORRECTIVE
+    allowed = list(MASK_SLIDERS) if allow_mask else CORRECTIVE + NUDGE_LOOK_KEYS
     changes = {}
     for pair in pairs:
         key, _, value = pair.partition("=")
@@ -382,6 +495,8 @@ MASK_SLIDERS = {
     "Saturation": ("LocalSaturation", 100.0),
 }
 MASK_KINDS = ("subject", "sky", "background", "people")
+# Look sliders a whole-photo nudge may change (split toning is solved, not nudged).
+NUDGE_LOOK_KEYS = look_stage.TONE_KEYS + look_stage.SAT_KEYS + look_stage.BAND_KEYS
 
 
 def _find_photo(report, photo):
@@ -424,13 +539,22 @@ def run_nudge(bridge, run_dir, photo, changes, mask=None):
 
     if mask is None:
         sliders = dict(p["final"])
+        look_settings = dict(p.get("look_settings") or {})
+        base = report["reference"].get("creative_look") or {}
         for key, delta in changes.items():
-            if key not in CORRECTIVE:
+            if key in NUDGE_LOOK_KEYS:
+                current = look_settings.get(key, base.get(key, 0.0))
+                look_settings[key] = round(max(-100.0, min(100.0, float(current) + delta)), 1)
+            elif key in CORRECTIVE:
+                sliders[key] = sliders.get(key, 0.0) + delta
+            else:
                 raise ValueError(f"{key} can only be changed inside a mask (--mask)")
-            sliders[key] = sliders.get(key, 0.0) + delta
         sliders = clamp(sliders, p["is_raw"])
-        _apply(bridge, [{"id": p["id"], "settings": _corrective_settings(sliders)}], warnings, lambda m: None)
+        changed_look = {k: v for k, v in look_settings.items() if k in changes}
+        _apply(bridge, [{"id": p["id"], "settings": {**_corrective_settings(sliders), **changed_look}}],
+               warnings, lambda m: None)
         p["final"] = sliders
+        p["look_settings"] = look_settings
         tag = "photo"
     else:
         if mask not in MASK_KINDS:
@@ -547,6 +671,9 @@ def main(argv=None):
     m.add_argument("--color-only", action="store_true",
                    help="match white balance only; keep each photo's own exposure and tone")
     m.add_argument("--no-learning", action="store_true", help="don't use or update what has been learned")
+    m.add_argument("--no-look", action="store_true",
+                   help="match light only (white balance, exposure, tone); skip matching colour and contrast")
+    m.add_argument("--look-strength", type=float, default=1.0, help="0..1, how much of the look matching to apply")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -569,12 +696,15 @@ def main(argv=None):
         if args.cmd == "match":
             if not 0.0 <= args.strength <= 1.0:
                 parser.error("--strength must be between 0 and 1")
+            if not 0.0 <= args.look_strength <= 1.0:
+                parser.error("--look-strength must be between 0 and 1")
             out = Path(args.out) if args.out else RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
             learner = None if args.no_learning else Learner()
             report = run_match(bridge, out, strength=args.strength, tolerance=args.tolerance,
                                max_iterations=args.max_iterations, size=args.size, label=args.label,
                                skin=args.skin, color_only=args.color_only, learner=learner,
-                               runs_dir=RUNS_DIR if not args.out else None, log=log)
+                               runs_dir=RUNS_DIR if not args.out else None, log=log,
+                               look=not args.no_look, look_strength=args.look_strength)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             p = run_nudge(bridge, args.run, args.photo, parse_changes(args.changes, allow_mask=bool(args.mask)),
@@ -601,13 +731,15 @@ def main(argv=None):
 def _summary(report):
     return {
         "reference": report["reference"]["fileName"],
+        "baked_reference": report.get("baked_reference"),
         "reference_skin": report["reference"].get("skin"),
         "contact_sheet": report["contact_sheet"],
         "contact_sheet_before": report["contact_sheet_before"],
         "warnings": report["warnings"],
         "photos": [
-            {k: p.get(k) for k in ("fileName", "start_error", "final_error", "iterations", "flags", "final",
-                                   "learned_adjustment", "skin_vs_reference")}
+            {k: p.get(k) for k in ("fileName", "start_error", "final_error", "look_start_error", "look_final_error",
+                                   "look_note", "iterations", "flags", "final", "learned_adjustment",
+                                   "skin_vs_reference")}
             for p in report["photos"]
         ],
     }

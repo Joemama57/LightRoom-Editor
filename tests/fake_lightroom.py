@@ -43,7 +43,11 @@ class FakeLightroom:
     def render(self, items, size=1024):
         for item in items:
             p = self.photos[item["id"]]
-            img = render(p["raw"], p["settings"])
+            settings = p["settings"]
+            if p.get("fileFormat") not in ("RAW", "DNG"):
+                # JPEG Temperature is a -100..100 offset (+ = warmer), roughly a mired each.
+                settings = dict(settings, Temperature=1e6 / (1e6 / 5500 - float(settings.get("Temperature", 0.0))))
+            img = render(p["raw"], settings)
             Image.fromarray((img * 255).round().astype(np.uint8)).save(item["path"], quality=95)
             self.renders += 1
         return [item["path"] for item in items]

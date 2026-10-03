@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from engine import look
 from engine.settings import split, starting_corrective
 from engine.workflow import parse_changes, run_match, run_nudge
 from tests.fake_lightroom import FakeLightroom
@@ -96,7 +97,11 @@ def test_match_end_to_end(lightroom, tmp_path):
     for pid in ("tung", "shade", "under"):
         s = lightroom.photos[pid]["settings"]
         for key, value in LOOK.items():
-            assert s[key] == value
+            if key in look.LOOK_KEYS:
+                # The look stage may add a small per-photo offset on top.
+                assert abs(s[key] - value) <= look.LIMIT + 1e-6 or key.endswith("Hue")
+            else:
+                assert s[key] == value
         assert s["CropTop"] == 0.0 and s["Sharpness"] == 25
         assert s["WhiteBalance"] == "Custom"
 
@@ -160,7 +165,11 @@ def test_nudge_updates_photo_and_report(lightroom, tmp_path):
 
 def test_nudge_rejects_unknown_slider():
     with pytest.raises(ValueError):
-        parse_changes(["Saturation=+10"])
+        parse_changes(["Clarity2012=+10"])
+    with pytest.raises(ValueError):
+        parse_changes(["SplitToningShadowHue=+10"])  # solved, not nudged
+    assert parse_changes(["SaturationAdjustmentBlue=+8", "Contrast2012=-5"]) == {
+        "SaturationAdjustmentBlue": 8.0, "Contrast2012": -5.0}
 
 
 def test_settings_lightroom_ignores_become_warnings(lightroom, tmp_path):
@@ -307,7 +316,7 @@ def test_nudge_inside_a_mask(lightroom, tmp_path):
     (mask,) = lightroom.photos["tung"]["settings"]["MaskGroupBasedCorrections"]
     assert mask["LocalTemperature"] == pytest.approx(-0.15)
     with pytest.raises(ValueError):
-        run_nudge(lightroom, tmp_path, "DSC0002", {"Saturation": 10.0})  # local-only slider without a mask
+        run_nudge(lightroom, tmp_path, "DSC0002", {"Clarity2012": 10.0})  # not a slider Match Look moves
 
 
 def test_learning_skips_photos_that_are_gone(lightroom, tmp_path):
