@@ -52,6 +52,13 @@ LOOK_ITERATIONS = 4
 PER_PHOTO_LOOK_LIMIT = 12.0
 SUBTITLE_CHARS = 58  # what fits under one contact-sheet tile
 PER_PHOTO_BAND_RATIO = 2.0
+# Photos from the reference's own shoot (same camera and file type, taken within
+# a few hours) were already evened out by the camera's auto-exposure. Matching
+# their brightness to the reference's would follow content instead (a close-up
+# of a white car would be darkened), so they keep the reference's exposure and
+# tone, with only a small exposure correction.
+SAME_SHOOT_HOURS = 3.0
+SAME_SHOOT_EV = 0.3
 # Grade fit on the reference's original (same pixels, so it can move further).
 GRADE_LIGHT_ITERATIONS = 8
 GRADE_LOOK_ITERATIONS = 8
@@ -310,6 +317,7 @@ def run_match(
 
     baked = look and look_stage.is_baked(creative)
     grade_fit = None
+    shoot_ref = ref  # whose shoot, camera and light the targets are compared with
     if baked:
         source = find_original(ref, targets, original)
         if source:
@@ -317,6 +325,7 @@ def run_match(
             creative, grade_fit = fit_grade(bridge, ref, source, creative, ref_corrective, ref_metrics, ref_path,
                                             out_dir, size, look_strength, warnings, log,
                                             grades_dir=grades_dir, refit=refit)
+            shoot_ref = source
         else:
             look_per_photo = True
             msg = ("Couldn't find the unedited original of the reference among the selected photos; matching colour "
@@ -333,6 +342,12 @@ def run_match(
         t_raw = is_raw(t)
         camera = t.get("cameraModel")
         start, wb_from_camera = starting_corrective(ref_corrective, ref_raw, t_raw, t.get("settings"))
+        shoot = not color_only and same_shoot(shoot_ref, t)
+        tone_limits = (SAME_SHOOT_EV, 0.0) if shoot else Options().tone_limits
+        if shoot and grade_fit and grade_fit.get("light"):
+            # The original's own light, as fitted: the copy's sliders don't carry it.
+            for key in CORRECTIVE[2:]:
+                start[key] = float(grade_fit["light"].get(key, start[key]))
         if color_only:
             # Keep this photo's own exposure and tone; only white balance is solved.
             for key in CORRECTIVE[2:]:
@@ -343,6 +358,8 @@ def run_match(
             flags.append("different_camera")
         if t_raw != ref_raw:
             flags.append("different_file_type")
+        if shoot:
+            flags.append("same_shoot")
         own = t.get("settings") or {}
         state[t["id"]] = {
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
@@ -352,7 +369,9 @@ def run_match(
             "before_look": _look_fingerprint(own, creative),
             "wb_from_camera": wb_from_camera,
             "options": Options(prior=prior, skin=skin, color_only=color_only,
-                               wb_limits=wb_limits(t_raw, wb_from_camera), light_only=light_only),
+                               wb_limits=wb_limits(t_raw, wb_from_camera), light_only=light_only,
+                               tone_limits=tone_limits),
+            "same_shoot": shoot,
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
         }
@@ -439,11 +458,18 @@ def run_match(
         s["final_error"] = match_error(ref_metrics, s["final_metrics"], skin=o.skin, color_only=o.color_only,
                                        light_only=o.light_only)
         s["flags"] = flags_for(s["final_metrics"], s["proposal"], tolerance)
-        # Only worth a look when the limit kept it from matching.
-        if s["final_error"] >= tolerance and not o.color_only and at_tone_limit(s["start"], s["proposal"].sliders, s["is_raw"], o.tone_limits):
+        # Only worth a look when the limit kept it from matching. A photo from
+        # the reference's shoot is held near its exposure on purpose: what's
+        # left is content, not a failed match.
+        if s["same_shoot"]:
+            # Judge it on colour alone: its brightness differs by content.
+            color_error = match_error(ref_metrics, s["final_metrics"], color_only=True)
+            if color_error < tolerance and "not_converged" in s["flags"]:
+                s["flags"].remove("not_converged")
+        elif s["final_error"] >= tolerance and not o.color_only and at_tone_limit(s["start"], s["proposal"].sliders, s["is_raw"], o.tone_limits):
             s["flags"].append("tone_limited")
         unscaled = strength == 1.0 and not s["learned_adjustment"]
-        if unscaled and s["final_error"] >= tolerance and "not_converged" not in s["flags"]:
+        if unscaled and not s["same_shoot"] and s["final_error"] >= tolerance and "not_converged" not in s["flags"]:
             s["flags"].append("not_converged")
         if s.get("look_limited"):
             s["flags"].append("look_limited")
@@ -512,6 +538,18 @@ def run_match(
 def _stem(name):
     stem = Path(name or "").stem.strip()
     return EXPORT_SUFFIX.sub("", stem).strip().lower()
+
+
+def same_shoot(ref, target):
+    """True when `target` comes from the same shoot as `ref`: same camera and
+    file type, and capture times within SAME_SHOOT_HOURS. Without capture
+    times it can't tell, so it says no."""
+    a, b = ref.get("captureTime"), target.get("captureTime")
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    if not ref.get("cameraModel") or ref.get("cameraModel") != target.get("cameraModel"):
+        return False
+    return is_raw(ref) == is_raw(target) and abs(a - b) <= SAME_SHOOT_HOURS * 3600
 
 
 def find_original(ref, photos, name=None):

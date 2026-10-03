@@ -445,3 +445,30 @@ def test_learn_skip_marks_the_run_and_learns_nothing(lightroom, tmp_path, monkey
     assert wf.main(["learn", "--skip"]) == 0
     assert json.loads((runs / "01" / "report.json").read_text())["learned"] == "skipped: by user"
     assert not (tmp_path / "learning.json").exists()
+
+
+def _shoot(target_time, camera="Sony A7 IV"):
+    """A reference and a close-up of something brighter, under the same light."""
+    scene = make_scene(seed=0)
+    ref = photo(capture(scene, 5500), "DSC0001.ARW", settings=dict(REF_SETTINGS))
+    close = photo(capture(np.clip(scene * 1.8, 0, 0.9), 5500), "DSC0002.ARW", camera=camera)
+    ref["captureTime"], close["captureTime"] = 0.0, target_time
+    return FakeLightroom({"ref": ref, "close": close}, active="ref")
+
+
+def test_a_close_up_from_the_same_shoot_keeps_the_references_exposure(tmp_path):
+    report = run_match(_shoot(600.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" in p["flags"]
+    assert abs(p["final"]["Exposure2012"] - REF_SETTINGS["Exposure2012"]) <= 0.3 + 1e-6
+    for key in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"):
+        assert p["final"][key] == REF_SETTINGS[key]
+    assert not {"not_converged", "tone_limited"} & set(p["flags"])
+
+
+@pytest.mark.parametrize("time, camera", [(5 * 3600.0, "Sony A7 IV"), (600.0, "Canon R6"), (None, "Sony A7 IV")])
+def test_other_shoots_are_matched_on_brightness(tmp_path, time, camera):
+    report = run_match(_shoot(time, camera), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" not in p["flags"]
+    assert p["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"] - 0.3  # the brighter content is pulled down

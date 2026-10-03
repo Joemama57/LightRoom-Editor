@@ -55,6 +55,11 @@ Read `$ARGUMENTS`. If it doesn't say, decide from the reference preview. You can
   - The copy may be a crop of the original: it is lined up automatically. The fit renders the original about 30–40 times (a minute or two) to measure how this Lightroom responds. The result is kept, so later runs with the same reference reuse it instantly. `--refit` learns it again, for example after the user re-edits the copy.
   - With a learned grade, each photo only gets its white balance and exposure solved. The grade sets the tone.
   - `--look-strength 0.5` applies half of the learned grade. `--no-look` skips it.
+  - **If the user edited the original in Lightroom** and exported the copy from it, the exact settings beat a fitted grade. Tell the user how to use them instead:
+    1. On the original, open Develop ▸ History and click the last step of their own edit, before the first Match Look change, or click its oldest "Before Match Look" snapshot.
+    2. Check that it looks like the copy, then select the original as the active photo with the others (not the copy) and re-run.
+
+    The engine doesn't copy masks. If the edit used AI masks (sky, subject), suggest Lightroom's Sync Settings ▸ Masking from the original afterwards: Lightroom detects the masks again on each photo.
 - **Learning is on by default.** Each run:
   - first learns from any edits the user made to the previous run's photos;
   - starts from the slider response learned on this camera;
@@ -137,6 +142,9 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 - Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
 - `look_limited` (per-photo colour match only): a colour slider hit its limit and the photo still differs, usually because the content differs. Check it before nudging.
 - Never change photos outside this run. Don't change other creative settings such as profile, grain or vignette: those stay exactly the reference's.
+- `same_shoot`: the photo comes from the reference's own shoot (same camera and file type, taken within 3 hours). It keeps the reference's exposure and tone, with at most ±0.3 EV of correction, because the camera already evened out the light. Its `final_error` is high when its content differs (a close-up, more sky): that's expected.
+  - Don't nudge its exposure by comparing one object's brightness (for example white paint L*) with the reference: different framing changes those numbers.
+  - Only nudge its exposure if it clearly looks darker or brighter than the reference on the contact sheet, by at most ±0.3, and say why.
 - **When the user approves some photos and not others:** if the approved ones carry a look nudge the others lack, apply that same change to the whole set and to the stored grade with one command, instead of nudging photos one by one:
   ```
   PY -m engine.workflow nudge --run RUN --photo all --grade HueAdjustmentOrange=-20 HueAdjustmentYellow=-20
