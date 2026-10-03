@@ -56,3 +56,28 @@ def test_uint8_input_matches_float():
 def test_metrics_round_trip():
     m = measure(np.full((8, 8, 3), 0.3))
     assert type(m).from_dict(m.to_dict()) == m
+
+
+def _grey_and_cream():
+    """Half mid-grey, a third cream fabric: the cream sits near the cast estimate."""
+    img = np.full((60, 60, 3), 0.45)
+    img[:20] = [0.62, 0.55, 0.40]  # cream / sand
+    img[20:30] = [0.85, 0.85, 0.85]  # a bright white curtain (L* about 89)
+    return img
+
+
+def test_warm_content_can_be_left_out_of_the_neutrals():
+    from engine.measure import measure, neutral_options
+    plain = measure(_grey_and_cream(), neutral_hint=(0.0, 0.0))
+    with neutral_options(no_warm=True):
+        cool = measure(_grey_and_cream(), neutral_hint=(0.0, 0.0))
+    assert abs(cool.b) < 1.0 and cool.b <= plain.b
+    assert measure(_grey_and_cream(), neutral_hint=(0.0, 0.0)) == plain  # off again after the block
+
+
+def test_bright_whites_can_count_as_neutrals():
+    from engine.measure import measure, neutral_options
+    plain = measure(_grey_and_cream(), neutral_hint=(0.0, 0.0))
+    with neutral_options(bright=True):
+        bright = measure(_grey_and_cream(), neutral_hint=(0.0, 0.0))
+    assert bright.neutral_fraction > plain.neutral_fraction

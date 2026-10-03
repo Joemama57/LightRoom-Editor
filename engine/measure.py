@@ -1,5 +1,6 @@
 """Measure the color balance and tone signature of a rendered preview."""
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -26,6 +27,31 @@ MIN_NEUTRAL_FRACTION = 0.02
 # when too few pixels are low in colour.
 LIGHT_CHROMA = 20.0
 LIGHT_MIN_FRACTION = 0.1
+# Opt-in neutral readings (see neutral_options), both off by default until a bench
+# on real runs shows they help:
+# - no_warm: cream and gold fabric, sand and dry grass sit near the cast estimate
+#   and read as yellow "neutrals" (beach run 20261004-004044: b* +5..+15 against the
+#   reference's +2.4), so every solve cools. Warm-hued pixels (CIELAB hue in
+#   WARM_HUE, chroma above WARM_CHROMA) are left out when enough others remain.
+# - bright: whites up to BRIGHT_NEUTRAL_L count (hotel run 20261004-005531: the
+#   window-lit curtain sat above L* 85, so the neutrals were lamp-lit sheets).
+WARM_HUE = (60.0, 95.0)
+WARM_CHROMA = 8.0
+BRIGHT_NEUTRAL_L = 95.0
+_NEUTRAL_OPTIONS = {"no_warm": False, "bright": False}
+
+
+@contextmanager
+def neutral_options(no_warm=False, bright=False):
+    """Measure neutrals without warm-hued pixels and/or with bright whites, for
+    the duration of the block."""
+    old = dict(_NEUTRAL_OPTIONS)
+    _NEUTRAL_OPTIONS.update(no_warm=bool(no_warm), bright=bool(bright))
+    try:
+        yield
+    finally:
+        _NEUTRAL_OPTIONS.clear()
+        _NEUTRAL_OPTIONS.update(old)
 
 
 @dataclass
@@ -96,7 +122,13 @@ def measure(img, neutral_hint=None, face_boxes=None):
     # every pixel out of the selection. The cast is found by narrowing in on the
     # largest low-chroma cluster (median, shrinking radius), so a big saturated
     # area like foliage or a red wall drops out instead of dragging the estimate.
-    midtones = (usable[:, 0] >= NEUTRAL_L_RANGE[0]) & (usable[:, 0] <= NEUTRAL_L_RANGE[1])
+    top_L = BRIGHT_NEUTRAL_L if _NEUTRAL_OPTIONS["bright"] else NEUTRAL_L_RANGE[1]
+    midtones = (usable[:, 0] >= NEUTRAL_L_RANGE[0]) & (usable[:, 0] <= top_L)
+    if _NEUTRAL_OPTIONS["no_warm"]:
+        hue = np.degrees(np.arctan2(usable[:, 2], usable[:, 1])) % 360
+        warm = (np.hypot(usable[:, 1], usable[:, 2]) > WARM_CHROMA) & (hue >= WARM_HUE[0]) & (hue <= WARM_HUE[1])
+        if (midtones & ~warm).sum() >= MIN_NEUTRAL_FRACTION * len(img):
+            midtones &= ~warm
     cast = np.median(usable[midtones, 1:] if midtones.any() else usable[:, 1:], axis=0)
     radii = NEUTRAL_RADII
     if neutral_hint is not None:

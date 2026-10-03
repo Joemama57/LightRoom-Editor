@@ -31,6 +31,7 @@ from PIL import Image
 
 from . import align, contact_sheet, faces, subject
 from . import look as look_stage
+from . import measure as measure_stage
 from . import skin as skin_model
 from .bridge import Bridge, BridgeError
 from .guards import MOSTLY_CLIPPED, different_scene, flags_for
@@ -95,6 +96,15 @@ SAME_READING_TINT = 3.0
 # The shoot's median move is no guide when it sits on the SAME_SHOOT_MIRED limit
 # (within this many mired): most frames were fooled by their content the same way.
 SHOOT_OUTLIER_WALL = 1.0
+# Nor is a frame pulled whose own solve lowered its error without reaching the
+# limit: it found its light. A same-shoot raw whose solve ends on the limit
+# (SAME_SHOOT_MIRED / SAME_SHOOT_TINT, within SHOOT_WALL_MARGIN) wanted to go further
+# than the light can explain: its content drove it. It goes back to where it
+# started (its camera reading, plus the user's offset when that applies, or the
+# reference's own white balance), flag wb_at_limit. Five of seven frames on the
+# beach run (20261004-004044) and both on the hotel room run (20261004-005531) hit
+# a limit, every one cooler than the user's own grade.
+SHOOT_WALL_MARGIN = 0.5
 # A shoot is not always evened out by the camera: in a ceremony shot on manual
 # exposure, frames toward the stage lights come out brighter and frames of the crowd
 # darker (run 20261003-230103: mid-tones 52 and 72-76 against the reference's 61,
@@ -217,6 +227,15 @@ CALM_SKIN_CONTENT = True
 # almost all wall panels), unless faces were actually detected. Their brightness
 # doesn't say how bright the faces are.
 SKIN_FACE_MAX_FRACTION = 0.25
+# Whether a photo is "much more colourful" is judged without saturated reds and
+# pinks (CIELAB hue below CALM_DECOR_HUE[0] or above CALM_DECOR_HUE[1], chroma over
+# CALM_DECOR_CHROMA): flowers and fabric, not the grade. Faces (chroma 13-30) stay
+# in. And a photo from the reference's shoot shares its light and sliders, so its
+# extra colour is the scene's: it is calmed only when real faces were found
+# (--face-skin) and they are more colourful than the reference's. Without them the
+# "skin" is often the walls (hotel room run: 23-39% of the frame).
+CALM_DECOR_HUE = (45.0, 320.0)
+CALM_DECOR_CHROMA = 30.0
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -415,9 +434,15 @@ def learn_from_run(bridge, run_dir, learner, log=print, backup_to=None):
     return learned
 
 
-def run_match(bridge, out_dir, *, face_skin=False, skin_error=False, skin_wb=False, **kwargs):
+def run_match(bridge, out_dir, *, face_skin=False, skin_error=False, skin_wb=False, neutral_no_warm=False,
+              bright_neutrals=False, **kwargs):
     """Match the selected photos to the active one: _run_match, plus the opt-in
     subject-first colour options (engine/subject.py). Each turns on `skin`.
+
+    neutral_no_warm: leave warm-hued pixels (cream, gold, sand, dry grass) out
+        of the neutral reading (measure.WARM_HUE). Off by default.
+    bright_neutrals: let whites up to L* 95 count as neutrals (window-lit
+        curtains in mixed light). Off by default.
 
     face_skin: measure skin inside detected faces only (engine/faces.py).
     skin_error: judge renders with the skin-weighted CIEDE2000 error.
@@ -427,9 +452,13 @@ def run_match(bridge, out_dir, *, face_skin=False, skin_error=False, skin_wb=Fal
     face_skin = face_skin or skin_wb
     if face_skin or skin_error or skin_wb:
         kwargs["skin"] = True
-    with subject.use(face_skin=face_skin, skin_error=skin_error, skin_wb=skin_wb) as chosen:
+    with subject.use(face_skin=face_skin, skin_error=skin_error, skin_wb=skin_wb) as chosen, \
+            measure_stage.neutral_options(no_warm=neutral_no_warm, bright=bright_neutrals):
         report = _run_match(bridge, out_dir, **kwargs)
         note = faces.fallback_warning()
+    if neutral_no_warm or bright_neutrals:
+        report["options"].update(neutral_no_warm=neutral_no_warm, bright_neutrals=bright_neutrals)
+        (Path(out_dir) / "report.json").write_text(json.dumps(report, indent=2))
     if any(chosen.report().values()) or note:
         report["options"]["subject"] = chosen.report()
         if face_skin:
@@ -581,10 +610,12 @@ def _run_match(
         other_format = not color_only and same_shoot_other_format(shoot_ref, t)
         limits_wb = wb_limits(t_raw, wb_from_camera)
         flags_wb = []
+        shoot_wall = None  # the same-shoot white-balance limits, when they apply (SHOOT_WALL_MARGIN)
         if shoot:
             tone_limits = (SAME_SHOOT_EV, 0.0)
             if t_raw and wb_from_camera:
                 limits_wb = (min(limits_wb[0], SAME_SHOOT_MIRED), min(limits_wb[1], SAME_SHOOT_TINT))
+                shoot_wall = limits_wb
             elif t_raw and ref_raw and hold_shoot_wb:
                 limits_wb = (SHOOT_HOLD_MIRED, SHOOT_HOLD_TINT)
                 flags_wb = ["wb_from_reference"]
@@ -594,6 +625,7 @@ def _run_match(
                 # against 4956 K on run 20261004-004044).
                 limits_wb = (SAME_SHOOT_MIRED if limits_wb[0] is None else min(limits_wb[0], SAME_SHOOT_MIRED),
                              limits_wb[1])
+                shoot_wall = limits_wb
         elif other_format:
             tone_limits = (Options().tone_limits[0], SHOOT_OTHER_FORMAT_TONE)
             limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
@@ -642,6 +674,10 @@ def _run_match(
         if offset_applied:
             flags.append("wb_offset_from_reference")
         flags += flags_wb
+        if flags_wb:
+            shoot_wall = None  # held at or near the user's choice: its own limits are the point
+        elif shoot_wall is not None:
+            shoot_wall = limits_wb  # widened when the user's choice is far from this camera reading
         own = t.get("settings") or {}
         state[t["id"]] = {
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
@@ -655,6 +691,7 @@ def _run_match(
                                judge_colour=shoot),
             "same_shoot": shoot or other_format,
             "shoot_wb": shoot and t_raw and wb_from_camera,
+            "shoot_wall": shoot_wall,
             "prior_source": prior_source,
             "history": [], "done": False, "extra_flags": flags,
             "target": ref_metrics,
@@ -715,6 +752,7 @@ def _run_match(
     for s in state.values():
         s["matched"] = blend(s["start"], s["proposal"].sliders, strength, s["is_raw"])
     _pull_shoot_outliers(state, log, tolerance)
+    _back_off_shoot_walls(state, log)
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
@@ -722,7 +760,7 @@ def _run_match(
                               light_only=o.light_only) for h in s["history"]]
         best = min(range(len(errors)), key=errors.__getitem__)
         matched = s["matched"]
-        pulled = "wb_from_shoot" in s["extra_flags"]
+        pulled = "wb_from_shoot" in s["extra_flags"] or "wb_at_limit" in s["extra_flags"]
         s["light"] = light_bucket(matched if pulled else p.sliders, s["is_raw"])
         final, learned = matched, None
         if learner is not None:
@@ -781,7 +819,7 @@ def _run_match(
             # Judge it on colour alone: its brightness differs by content.
             color_error = match_error(ref_metrics, s["final_metrics"], color_only=True)
             # Held at the reference's white balance: what colour gap is left is its content.
-            held = bool({"wb_from_reference", "wb_held_same_reading"} & set(s["extra_flags"]))
+            held = bool({"wb_from_reference", "wb_held_same_reading", "wb_at_limit"} & set(s["extra_flags"]))
             if (color_error < tolerance or held) and "not_converged" in s["flags"]:
                 s["flags"].remove("not_converged")
         elif faces_set:
@@ -1107,6 +1145,7 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
     that doesn't get closer keeps the reference's own values."""
     ref_look = look_stage.measure_look_file(ref_path)
     ref_chroma = ref_look["chroma"]
+    ref_plain = _chroma_without_decor(ref_path)
     plan = look_stage.Plan(tone=False)  # only Vibrance and Saturation, against mean and top chroma
     todo = {}
     for pid, s in state.items():
@@ -1116,6 +1155,15 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
             continue
         cur, masks = look_stage.measure_look_file_with_masks(s["preview"])
         if min(cur["chroma"][k] / max(ref_chroma[k], 1e-6) for k in ("mean", "top")) < CALM_RATIO:
+            continue
+        plain = _chroma_without_decor(s["preview"])
+        if min(plain[k] / max(ref_plain[k], 1e-6) for k in ("mean", "top")) < CALM_RATIO:
+            log(f"{s['photo']['fileName']}: more colourful than the reference only in its reds and pinks "
+                "(flowers, a dress): its content; colour left as the reference's")
+            continue
+        if s["same_shoot"] and s["final_metrics"].skin_source != "faces":
+            log(f"{s['photo']['fileName']}: more colourful than the reference in the same light, with no faces "
+                "found to say the grade is too strong: its content; colour left as the reference's")
             continue
         skin_chroma = _skin_chroma(s["final_metrics"])
         if CALM_SKIN_CONTENT and ref_skin_chroma is not None and skin_chroma is not None and skin_chroma <= ref_skin_chroma:
@@ -1192,6 +1240,18 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
             log(f"{s['photo']['fileName']}: colour calmed ({look_stage.describe(s['calmed_colour']['offsets'])}); "
                 f"chroma {s['calmed_colour']['chroma_before']['mean']} -> {s['calmed_colour']['chroma_after']['mean']} "
                 f"(reference {s['calmed_colour']['chroma_reference']['mean']})")
+
+
+def _chroma_without_decor(path):
+    """Mean and top-decile chroma like look.measure_look, leaving out saturated
+    reds and pinks (CALM_DECOR_HUE): flowers and fabric, not the grade."""
+    _, lab = look_stage._pixels(load_image(path))
+    c = np.hypot(lab[:, 1], lab[:, 2])
+    h = np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) % 360
+    decor = (c > CALM_DECOR_CHROMA) & ((h < CALM_DECOR_HUE[0]) | (h > CALM_DECOR_HUE[1]))
+    c = c[~decor] if (~decor).any() else c
+    top = c[c >= np.percentile(c, 90)]
+    return {"mean": float(c.mean()), "top": float(top.mean()) if len(top) else 0.0}
 
 
 def _skin_chroma(m):
@@ -1335,6 +1395,9 @@ def _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warni
     for pid, s in state.items():
         if "wb_from_shoot" in s["extra_flags"] or not trusted(s["final_metrics"]):
             continue
+        held = {"wb_from_reference", "wb_held_same_reading", "wb_at_limit"} & set(s["extra_flags"])
+        if held and s["final_metrics"].skin_source != "faces":
+            continue  # kept at the user's choice for this light: skin-coloured walls and wood can't overrule it
         prior = s["options"].prior if s["options"].prior is not None else default_prior(s["is_raw"])
         live[pid] = np.array(prior, dtype=float)[:2, :2]  # skin (b, a) per (Temperature, Tint)
     for n in range(SKIN_COLOR_PASSES):
@@ -1441,12 +1504,48 @@ def _pull_shoot_outliers(state, log=print, tolerance=None):
             continue
         if tolerance is not None and _start_error(s) is not None and _start_error(s) < tolerance:
             continue  # already right at its own camera reading
+        errors = _solve_errors(s)
+        if errors and min(errors) < errors[0] and not _at_wall(moves[id(s)], s.get("shoot_wall")):
+            continue  # its own solve got better without reaching the limit: it found its light
         x = _to_internal(s["matched"], True)
         x0 = _to_internal(s["start"], True)
         x[0], x[1] = x0[0] + median_temp, x0[1] + median_tint
         s["matched"] = _to_sliders(x, True)
         s["extra_flags"].append("wb_from_shoot")
         log(f"{s['photo']['fileName']}: white balance followed the content; using the shoot's instead")
+
+
+def _solve_errors(s):
+    """The error of every render of a photo's solve, as the solve judged it."""
+    o = s.get("options")
+    if o is None:
+        return []
+    return [match_error(s["target"], h["metrics"], skin=o.skin, color_only=o.color_only or o.judge_colour,
+                        light_only=o.light_only) for h in s.get("history") or []]
+
+
+def _at_wall(move, wall):
+    return wall is not None and (abs(move[0]) >= wall[0] - SHOOT_WALL_MARGIN
+                                 or abs(move[1]) >= wall[1] - SHOOT_WALL_MARGIN)
+
+
+def _back_off_shoot_walls(state, log=print):
+    """A same-shoot raw whose solve ended on the shoot's white-balance limit was
+    driven by its content: it goes back to its starting white balance, flag
+    wb_at_limit (see SHOOT_WALL_MARGIN)."""
+    for s in state.values():
+        wall = s.get("shoot_wall")
+        if not s["is_raw"] or wall is None or "wb_from_shoot" in s["extra_flags"]:
+            continue
+        x0, x1 = _to_internal(s["start"], True), _to_internal(s["proposal"].sliders, True)
+        move = (x1[0] - x0[0], x1[1] - x0[1])  # the solve's own move, before strength
+        if not _at_wall(move, wall):
+            continue
+        s["matched"] = {**s["matched"], "Temperature": s["start"]["Temperature"], "Tint": s["start"]["Tint"]}
+        s["extra_flags"].append("wb_at_limit")
+        log(f"{s['photo']['fileName']}: white balance solve hit the shoot's limit ({move[0]:+.0f} mired, Tint "
+            f"{move[1]:+.0f}), so it followed the content; kept at {s['start']['Temperature']:.0f} / "
+            f"{s['start']['Tint']:+.0f}")
 
 
 def _start_error(s):
@@ -2096,7 +2195,9 @@ def _tiles(report, key):
         tiles.append({
             "path": p[key],
             "title": p["fileName"],
-            "subtitle": _subtitle(f"error {err:.1f}", notes),
+            "subtitle": _subtitle(f"error {p['error_before_nudge']:.1f} -> {err:.1f} after your nudge"
+                                  if key == "preview" and p.get("error_before_nudge") is not None else f"error {err:.1f}",
+                                  notes),
             "highlight": key == "preview" and bool(REVIEW_FLAGS & set(p["flags"])),
         })
     return tiles
@@ -2174,8 +2275,9 @@ def _rerender(bridge, run_dir, report, p, tag):
     path = nudge_dir / f"{n:02d}_{tag}_{_safe(p)}.jpg"
     bridge.render([{"id": p["id"], "path": str(path)}], size=report.get("size", 1024))
     ref_metrics = Metrics.from_dict(report["reference"]["metrics"])
-    metrics = measure_file(path, (ref_metrics.a, ref_metrics.b))
     opts = report.get("options", {})
+    with measure_stage.neutral_options(no_warm=opts.get("neutral_no_warm"), bright=opts.get("bright_neutrals")):
+        metrics = measure_file(path, (ref_metrics.a, ref_metrics.b))
     p["preview"] = str(path)
     # The error the run reported, before the first nudge: a deliberate warm-up
     # then reads as "after your nudge", not as the photo getting worse.
@@ -2416,6 +2518,10 @@ def main(argv=None):
     m.add_argument("--no-even-shoot-tone", dest="even_shoot_tone", action="store_false",
                    help="keep photos from the reference's shoot at its exposure (the old behaviour)")
     _subject_args(m)
+    m.add_argument("--neutral-no-warm", action="store_true",
+                   help="leave cream, gold, sand and dry grass out of the neutral reading (experimental)")
+    m.add_argument("--bright-neutrals", action="store_true",
+                   help="count bright whites (window-lit curtains) as neutrals, up to L* 95 (experimental)")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -2453,7 +2559,8 @@ def main(argv=None):
                                look_per_photo=args.look_per_photo, original=args.original,
                                grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
                                hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue,
-                               even_shoot_tone=args.even_shoot_tone, **subject_kwargs(args))
+                               even_shoot_tone=args.even_shoot_tone, neutral_no_warm=args.neutral_no_warm,
+                               bright_neutrals=args.bright_neutrals, **subject_kwargs(args))
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,

@@ -1172,3 +1172,76 @@ def test_a_nudge_keeps_the_runs_error_and_says_it_is_after_the_nudge(lightroom, 
     run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Tint=-2"]))
     p = run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Tint=+2"]))
     assert p["error_before_nudge"] == before and p["error_note"] == "after your nudge"
+
+
+def test_a_solve_that_ends_on_the_shoots_limit_goes_back_to_where_it_started(tmp_path):
+    """Hotel room run 20261004-005531: lamp-lit sheets against the reference's daylit
+    curtain cooled both frames onto the 20 mired / 10 tint limits."""
+    lr = _shoot_off_wb(600.0)
+    lr.photos["ref"]["settings"]["WhiteBalance"] = "As Shot"  # no choice of the user's to start from
+    (p,) = run_match(lr, tmp_path, log=quiet)["photos"]
+    assert "wb_at_limit" in p["flags"] and "not_converged" not in p["flags"]
+    assert (p["final"]["Temperature"], p["final"]["Tint"]) == (p["start"]["Temperature"], p["start"]["Tint"])
+
+
+def test_a_solve_inside_the_shoots_limits_is_kept(tmp_path):
+    report = run_match(_stage(3000, {"other": (900.0, 3100)}), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "wb_at_limit" not in p["flags"]
+
+
+def test_a_frame_whose_own_solve_got_better_is_not_pulled_to_the_shoot():
+    """DSC00280 (beach run 20261004-004044): its own solve stayed near the camera and
+    the pull to the shoot's median took it from 2.04 to 2.61."""
+    from engine.measure import Metrics
+    from engine.solver import Options
+    from engine.workflow import _pull_shoot_outliers
+    L = {"p1": 5.0, "p25": 30.0, "p50": 50.0, "p75": 70.0, "p99": 90.0}
+
+    def m(b):
+        return {**Metrics(a=0.0, b=b, L=L, clipped_fraction=0.0, neutral_fraction=0.3).to_dict()}
+
+    state = _shoot_state([(8, -8), (14, 0), (19, -2), (6, -7), (-6, -2), (-7, -4), (-44, 12)])
+    s = state["6"]
+    s.update(options=Options(judge_colour=True), target=Metrics.from_dict(m(0.0)),
+             history=[{"metrics": m(6.0)}, {"metrics": m(1.5)}], shoot_wall=(80.0, 30.0))
+    before = dict(s["matched"])
+    _pull_shoot_outliers(state, quiet, tolerance=1.0)
+    assert s["matched"] == before and not s["extra_flags"]
+    s["shoot_wall"] = (44.0, 30.0)  # the same move on the limit: its content had it
+    _pull_shoot_outliers(state, quiet, tolerance=1.0)
+    assert s["extra_flags"] == ["wb_from_shoot"]
+
+
+def test_a_colourful_frame_from_the_references_shoot_keeps_its_colour_without_faces(tmp_path):
+    """Same light, same sliders: the extra colour is the scene's (hotel room run
+    20261004-005531, DSC00200: a pink dress and orange walls, Vibrance 19 -> 4)."""
+    lr = _colour_pair(2.0)
+    lr.photos["ref"]["captureTime"], lr.photos["t"]["captureTime"] = 0.0, 600.0
+    (p,) = run_match(lr, tmp_path, log=quiet)["photos"]
+    assert "same_shoot" in p["flags"] and "calmer_colour" not in p["flags"]
+    assert lr.photos["t"]["settings"]["Vibrance"] == 20
+
+
+def test_saturated_reds_alone_do_not_call_for_calmer_colour(tmp_path):
+    """A red floral arch made DSC00174 read 1.6x the reference's chroma (beach run 20261004-004044)."""
+    ref = photo(capture(make_scene(seed=0), 5500), "A.ARW", settings=dict(REF_SETTINGS, Vibrance=20, Saturation=3))
+    scene = make_scene(seed=1)[4:, 2:].copy()
+    scene[: scene.shape[0] // 3] = [0.40, 0.02, 0.05]  # red flowers
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(scene, 5500), "B.ARW")}, active="ref")
+    report = run_match(lr, tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "calmer_colour" not in p["flags"]
+    assert lr.photos["t"]["settings"]["Vibrance"] == 20
+    # With the reds counted, it reads much more colourful than the reference: it would have been calmed.
+    from engine import look as look_stage
+    full = lambda path: look_stage.measure_look_file(path)["chroma"]  # noqa: E731
+    ref, cur = full(report["reference"]["preview"]), full(p["preview"])
+    assert min(cur[k] / ref[k] for k in ("mean", "top")) >= workflow.CALM_RATIO
+
+
+def test_the_contact_sheet_says_an_error_is_after_the_users_nudge(lightroom, tmp_path):
+    run_match(lightroom, tmp_path, log=lambda m: None)
+    run_nudge(lightroom, tmp_path, "DSC0004", parse_changes(["Temperature=+300"]))
+    sheet = workflow._tiles(json.loads((tmp_path / "report.json").read_text()), "preview")
+    assert sum("after your nudge" in t["subtitle"] for t in sheet) == 1
