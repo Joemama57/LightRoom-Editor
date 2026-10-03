@@ -1,5 +1,27 @@
 # Review nudges
 
+## 2026-10-03 — The user found the solved portraits too contrasty
+Source: run 20261003-191845 (reference `DSC01303.ARW`: Contrast 7, Whites 3, Blacks −11), `DSC02121.ARW` (solved Blacks −51, Shadows +68), `DSC02201.ARW` (solved Whites +21); user: "i feel like the contrast it too much"
+Finding: Both portraits were unflagged with errors 1.55 and 1.65, and the review
+passed them. Their solved Blacks and Whites sat 40 and 18 away from the
+reference's. Nudged `Blacks2012=+20 Contrast2012=-5` and `Whites2012=-18
+Contrast2012=-5`; errors rose to 2.71 and 1.86. The user then said of
+`DSC02121.ARW` "the photo is like darken, brigten it more": it was solved to
+Exposure −0.73 from the reference's +0.19 without `exposure_from_skin`, and
+`Exposure2012=+0.4` (to −0.33) raised its error to 9.43. After brightening,
+the user said "the colors look a bit artificial"; `Vibrance=-10
+SaturationAdjustmentYellow=-10 SaturationAdjustmentRed=-8` (to Vibrance 10,
+Yellow −10, Red −23 against the reference's 20, 0, −15) was applied, error 9.21.
+The user then said "2201 is also darkened": `DSC02201.ARW` (solved −0.69) got
+`Exposure2012=+0.4` (to −0.29), error 1.86 → 7.02.
+Takeaway: In review, compare each photo's solved Blacks and Whites with the
+reference's. If either is more than about 15 further toward contrast (Blacks
+lower, Whites higher), look at that photo's depth at full size and not on the
+contact sheet, and say so in the report even when the error is under 2. A
+portrait solved more than about 0.5 EV below the reference with no
+`exposure_from_skin` flag needs the same look: the low error followed the
+bright backdrop and clothes, not the faces.
+
 ## 2026-10-03 — Every nudge raises the engine's error number
 Source: run 20261003-141934, `IMG_1964.JPG` (1.6 → 4.1 → 4.3), `IMG_1978.JPG` (1.2 → 4.8 → 5.0), `IMG_1967.JPG` (2.2 → 2.9 → 3.9), `IMG_1961.JPG` (1.5 → 1.9 → 2.5)
 Finding: The error measures neutrals and brightness against the reference. An

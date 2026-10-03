@@ -1,5 +1,20 @@
 # Evaluation: what the numbers and flags are worth
 
+## 2026-10-03 — Re-matching an already matched set moves nothing that shows
+Source: runs 20261003-180212 and 20261003-191845 (reference `DSC01303.ARW`, `--skin`, same 3 ILCE-7M4 raws, no edits in between: `engine.bridge selection` before the second run returned the first run's values)
+Finding: The second match ended within 38 K, 2 Tint and 0.11 EV of the first on
+every photo (`DSC01318.ARW` 2654 → 2656 K, +0.49 EV both times at the
+`same_shoot` cap; `DSC02121.ARW` 2588 → 2626 K, −0.84 → −0.73 EV;
+`DSC02201.ARW` 2741 → 2728 K, −0.79 → −0.69 EV), with errors 3.55 / 1.6 / 1.4 →
+3.54 / 1.55 / 1.65. `DSC01318.ARW` skin read a 13.5 then 13.6 against 10.3 on
+the reference ("more magenta") in both. The report's `final` Tint is fractional
+(2.5, 0.2, 2.1) while Lightroom holds whole numbers on these raws (3, 0, 2);
+the run warned "Lightroom didn't take Tint=0.5 on photo 601108 (has 1)".
+Takeaway: If the selection already holds the previous run's values, say so
+before matching: a re-run with the same reference and options will not change
+the result. Read a raw's Tint from `engine.bridge selection`, not from the
+report's `final`, and treat the "didn't take Tint" warning on a raw as rounding.
+
 ## 2026-10-03 — A low light error does not mean the look matches
 Source: run 20261003-141934, `IMG_1964.JPG` (`final_error` 1.6 with the wall 28° off in hue and the sky 7 L too light, see color-hsl.md); commit 047ccf8 ("reported low errors but didn't look matched")
 Finding: `final_error` covers neutrals and brightness only. A photo scored 1.6

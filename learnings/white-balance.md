@@ -1,5 +1,63 @@
 # White balance
 
+## 2026-10-03 — A same-shoot raw with a wrong as-shot white balance was left untouched
+Source: run 20261003-175141 (reference `DSC01303.ARW`, ILCE-7M4 raw at 2662 K, Tint 0, `--skin`), `DSC01318.ARW`, `DSC02121.ARW`, `DSC02201.ARW` (`report.json`, `contact_sheet.jpg`)
+Finding: `DSC01318.ARW` was taken 28 s after the reference on the same stage,
+with an as-shot white balance of 5550 K, Tint 11. It carries `same_shoot` and
+`wb_from_camera`, and after 6 iterations its `matched` Temperature and Tint
+equal its `start` (5550, 11.0); the error stayed at 18.46 (`not_converged`) and
+its skin read chroma 48.9 against 24.9 on the reference. With only one
+same-shoot raw there is no shoot median, so `wb_from_shoot` cannot apply. The
+two frames shot 3.6 h later (as shot 3800 K, not `same_shoot`) were solved and
+both ended at exactly 2914 K, with errors 18.5 → 3.9 and 22.5 → 4.2. The gap
+on `DSC01318.ARW` is about 2900 K, beyond two ±400 K nudges, so no nudge was
+made.
+Changed by run 20261003-180212 (same selection and reference, re-run 11 min
+later with no edits in between): the earlier run had left all three photos at
+white balance "Custom", so this run read `wb_from_camera` false on each, started
+every photo from the reference's 2662 K, Tint 0 and solved from there.
+`DSC01318.ARW` ended at 2654 K, Tint 2.8, Exposure +0.49 (the +0.3 cap), error
+6.7 → 3.55, flag `same_shoot` only, skin a 13.5, b 23.2, chroma 26.9 against
+10.3, 22.7, 24.9. The later frames ended at 2588 K and 2741 K (no longer the
+same value) with errors 18.2 → 1.6 and 12.0 → 1.4 and no flags.
+`reference_wb_offset` was null, so `wb_offset_from_reference` did not apply.
+Takeaway: Before matching, compare each `same_shoot` raw's as-shot Temperature
+with the reference's. If one is more than about 1500 K away and ends with
+`matched` equal to `start`, do not nudge: report it, and offer a second match
+on the same selection, which starts it from the reference's white balance
+because the photo is no longer "As Shot" (or give the reference's Temperature
+and Tint for the user to type in). Two photos ending at the same
+Temperature to the kelvin is probably a limit, not a solved value: say so.
+
+## 2026-10-03 — A single portrait against a white wall was solved 2800 K too warm
+Source: run 20261003-173030 (reference `DSC00183.ARW`, ILCE-7M4 raw, `--skin`), `DSC00232.ARW` (`iter_0/`, `final/`, `nudges/00_`, `01_`); median CIELAB of a patch of the white wall
+Finding: The reference's wall measured b −9.4 to −10.2. With only the look
+pasted and the as-shot white balance (6750 K, Tint 26), `DSC00232.ARW`'s wall
+measured b −8.5, within 1 of the reference. The match moved it to 9580 K,
+Tint 37.6 and the wall to a +4.3, b +5.4 (`not_converged`, error 10.1 → 4.4).
+Two nudges (−400 K and Tint −8, then −400 K) brought the wall to a +0.7,
+b +3.6, still about 13 b from the reference, and raised the error to 7.1. The
+frame is a single person in a yellow saree in front of an orange opening; the
+other six frames, all couples, ended at 5370–6110 K.
+Changed by run 20261003-174742 (same selection and reference, after commit
+6978868): `DSC00232.ARW` carries `wb_from_shoot` and ended at 6487 K, Tint 21.0
+(as shot 6750, 26). Its wall measured b −6.1 (left) and −7.0 (right) in
+`final/`, against −9.4 on the reference, with no nudge. Its error stayed at
+10.8 (`not_converged`, start 10.1), so the number does not follow the wall.
+In the same run the wall behind three couple frames (`DSC00201`, `DSC00214`,
+`DSC00256`, Tint solved to 20.0–23.0 from 24–30 as shot) measured a −3.7 to
+−4.9, b −13.6 to −13.8, against a −1.2, b −9.4 on the reference, while their
+skin read a 8.7–9.4 against 7.7. Wall and skin disagree on the Tint direction,
+so no Tint nudge was made.
+Takeaway: When a `same_shoot` raw ends more than about 1500 K from its as-shot
+value while the rest of the set stays near theirs, measure a neutral surface in
+`iter_0/` against the reference before nudging. If `iter_0` is already close,
+the as-shot value was right: two ±400 K nudges cannot undo it, so report the
+as-shot Temperature and Tint for the user to type in. The error number rises as
+the wall gets closer (nudges.md). With `wb_from_shoot` on the photo, expect
+the wall within about 3 b of the reference and a `not_converged` error near
+its start value: check the wall, and leave the Temperature alone if it holds.
+
 ## 2026-10-03 — Raw close-ups end at Tint +22 to +24 and the white paint reads pink
 Source: run 20261003-163645 (reference `IMG_1963.JPG`, edited in Lightroom, no grade fit), `IMG_1982.DNG`, `IMG_1983.DNG`, `IMG_1987.DNG` (`iter_6/`, `final/`, `nudges/00_`–`02_`); brightest 15% of each preview, median CIELAB
 Finding: The three DNG close-ups were solved to Tint +21.8, +23.6 and +24.3

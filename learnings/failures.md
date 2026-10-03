@@ -3,6 +3,17 @@
 Process mistakes that damaged results or the learning store. Read before every
 run.
 
+## 2026-10-03 — After a catalog change the previous run cannot be read, and stays unlearned
+Source: run 20261003-173030 (catalog `27 May 2025.lrcat`) following run 20261003-165410 (iPhone set, another catalog, photo ids 17321…); log line "Couldn't read last run's photos to learn from them: get_settings failed in Lightroom: ?:0: attempt to index a nil value"
+Finding: The engine asked the open catalog for the previous run's photo ids,
+the plugin raised a Lua error, and the learning step returned without learning
+or marking the run. Nothing wrong was learned (`corrections_learned` stayed 0,
+`preferences` empty). Run 20261003-165410 has no `learned` entry, so it will be
+tried again whenever a later run follows it directly.
+Takeaway: After a catalog switch, expect this line and report it as "previous
+run not learned from", not as a fault of the match. If the user wants that run
+learned, they need to reopen its catalog and run `PY -m engine.workflow learn`.
+
 ## 2026-10-03 — A reset between runs is learned as the user's taste
 Source: run 20261003-124236, `IMG_2001.DNG` (matched Shadows +50, Highlights −50, Whites −32.1, Blacks −50); `PY -m engine.learning show` → `raw|iPhone 16 Pro Max|cool light`; session 7324522b ("the engine also learned from my restore as if it were your edits")
 Finding: At the start of each run the engine compares the previous run's
