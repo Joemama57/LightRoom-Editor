@@ -10,6 +10,10 @@ PER_PHOTO_KEYS = {
     "orientation",
     "Orientation",
     "WhiteBalance",  # "As Shot"/"Custom" label; Temp/Tint are solved instead
+    # Which Auto white-balance algorithm: only means something with WhiteBalance
+    # "Auto", and the engine writes "Custom", so Lightroom drops it and every photo
+    # got a false "not taken" warning (bridal detail run 20261004-015614).
+    "AutoWhiteVersion",
     "IncrementalTemperature",  # JPEG/TIFF white balance; the bridge maps Temp/Tint onto these
     "IncrementalTint",
     "PaintBasedCorrections",

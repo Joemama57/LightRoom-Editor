@@ -43,15 +43,20 @@ LIGHT_MIN_L = 30.0
 WARM_HUE = (60.0, 95.0)
 WARM_CHROMA = 8.0
 BRIGHT_NEUTRAL_L = 95.0
-_NEUTRAL_OPTIONS = {"no_warm": False, "bright": False}
+# - whites_top: the whites level (light_L) is the WHITES_TOP_PERCENTILE of the
+#   low-colour pixels instead of their median, so hair, road and pale skin drop out
+#   and walls decide (outdoor saree run 20261004-014646: close-ups' medians matched
+#   the reference's while their real whites ended 2-7 L* brighter).
+WHITES_TOP_PERCENTILE = 75
+_NEUTRAL_OPTIONS = {"no_warm": False, "bright": False, "whites_top": False}
 
 
 @contextmanager
-def neutral_options(no_warm=False, bright=False):
-    """Measure neutrals without warm-hued pixels and/or with bright whites, for
-    the duration of the block."""
+def neutral_options(no_warm=False, bright=False, whites_top=False):
+    """Measure neutrals without warm-hued pixels and/or with bright whites, and
+    whites from their bright end, for the duration of the block."""
     old = dict(_NEUTRAL_OPTIONS)
-    _NEUTRAL_OPTIONS.update(no_warm=bool(no_warm), bright=bool(bright))
+    _NEUTRAL_OPTIONS.update(no_warm=bool(no_warm), bright=bool(bright), whites_top=bool(whites_top))
     try:
         yield
     finally:
@@ -126,7 +131,8 @@ def measure(img, neutral_hint=None, face_boxes=None):
     L = {f"p{p}": float(v) for p, v in zip(PERCENTILES, np.percentile(lab[:, 0], PERCENTILES))}
     plain = (np.hypot(lab[:, 1], lab[:, 2]) < LIGHT_CHROMA) & (lab[:, 0] >= LIGHT_MIN_L)
     light_fraction = float(plain.mean())
-    light_L = float(np.median(lab[plain, 0])) if light_fraction >= LIGHT_MIN_FRACTION else None
+    light_L = (float(np.percentile(lab[plain, 0], WHITES_TOP_PERCENTILE if _NEUTRAL_OPTIONS["whites_top"] else 50))
+               if light_fraction >= LIGHT_MIN_FRACTION else None)
 
     usable = lab[~clipped]
     if len(usable) == 0:
@@ -199,3 +205,26 @@ def measure(img, neutral_hint=None, face_boxes=None):
 def measure_file(path, neutral_hint=None):
     boxes = face_model.detect_file(path) if face_model.active() else None
     return measure(load_image(path), neutral_hint, boxes)
+
+
+# The least face skin (membership-weighted pixels, as a share of the frame) a face
+# reading needs.
+FACE_MIN_FRACTION = 0.002
+
+
+def face_reading(path):
+    """Membership-weighted (L*, a*, b*) of the skin inside faces found in an image,
+    whether or not --face-skin is on, or None without OpenCV or without a face.
+    Used as a guard only (shoot tone, the report), never to set a slider by itself."""
+    if not face_model.available():
+        return None
+    boxes = face_model.detect_file(path)
+    if not boxes:
+        return None
+    img = _downsample(load_image(path))
+    lab = srgb_to_lab(img.reshape(-1, 3)).reshape(img.shape)
+    w = face_model.weights(lab, boxes).reshape(-1)
+    if w.sum() < FACE_MIN_FRACTION * len(w):
+        return None
+    w = w / w.sum()
+    return tuple(float(v) for v in w @ lab.reshape(-1, 3))

@@ -455,6 +455,8 @@ def main(argv=None):
                          help="even the shoot's brightness (the default)")
         cmd.add_argument("--no-even-shoot-tone", dest="even_shoot_tone", action="store_false",
                          help="replay without evening the shoot's brightness")
+        cmd.add_argument("--whites-top", action="store_true",
+                         help="try judging the shoot's whites on their bright end")
         cmd.add_argument("--face-tone", action="store_true",
                          help="try brightening shoot frames toward the reference's faces (turns on --face-skin)")
         _subject_args(cmd)
@@ -466,7 +468,7 @@ def main(argv=None):
             run_dir = Path(args.run)
             before = load_report(run_dir)
             report, _ = rerun(run_dir, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
-                              even_shoot_tone=args.even_shoot_tone, face_tone=args.face_tone, **_subject_options(args))
+                              even_shoot_tone=args.even_shoot_tone, face_tone=args.face_tone, whites_top=args.whites_top, **_subject_options(args))
             old = {p["fileName"]: p for p in before["photos"]}
             rows = [{"photo": p["fileName"],
                      "as_run": {k: old[p["fileName"]]["final"][k] for k in ("Temperature", "Tint", "Exposure2012")},
@@ -478,7 +480,7 @@ def main(argv=None):
             print(json.dumps(save_answers(Bridge(), Path(args.run)), indent=1))
         else:
             print(json.dumps(bench(args.runs, log=lambda m: print(m, file=sys.stderr), hold_shoot_wb=args.hold_shoot_wb,
-                                   even_shoot_tone=args.even_shoot_tone, face_tone=args.face_tone, **_subject_options(args)), indent=1))
+                                   even_shoot_tone=args.even_shoot_tone, face_tone=args.face_tone, whites_top=args.whites_top, **_subject_options(args)), indent=1))
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

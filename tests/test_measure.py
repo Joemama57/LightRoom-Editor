@@ -101,3 +101,13 @@ def test_a_saturated_colour_is_not_clipping():
     assert measure(img).clipped_fraction == 0.0
     img[:32] = 0.0  # black in every channel is
     assert measure(img).clipped_fraction == 0.5
+
+
+def test_whites_top_reads_the_bright_end_of_the_whites():
+    from engine.measure import neutral_options
+    img = np.full((64, 64, 3), 0.85)  # white wall
+    img[:40] = 0.35  # grey road and hair, more of the frame
+    plain = measure(img).light_L
+    with neutral_options(whites_top=True):
+        top = measure(img).light_L
+    assert top > plain + 20

@@ -1312,3 +1312,77 @@ def test_a_copied_mask_that_makes_the_colour_worse_is_tried_without_temperature_
     assert [c[2] for c in lr.mask_calls] == [{"LocalTemperature": -14.5, "LocalHighlights2012": 28.0},
                                             {"LocalHighlights2012": 28.0},
                                             {"LocalTemperature": 0.0, "LocalHighlights2012": 0.0}]
+
+
+def test_hold_shoot_wb_starts_a_fooled_camera_reading_at_the_references_choice(tmp_path):
+    """Outdoor saree run 20261004-014646: a close-up's auto WB read a little warmer
+    than the wides' (the saree fooled it). With --hold-shoot-wb it starts at the
+    reference's own white balance, not its reading plus the offset."""
+    lr = _stage(3200, {"mate": (30.0, 5500), "fooled": (60.0, 5900), "far": (90.0, 9000)})
+    photos = {p["id"]: p for p in run_match(lr, tmp_path, hold_shoot_wb=True, log=quiet)["photos"]}
+    assert photos["fooled"]["start"]["Temperature"] == 3200 and "wb_from_reference" in photos["fooled"]["flags"]
+    assert photos["far"]["start"]["Temperature"] != 3200  # 50+ mired off: its own reading plus the offset
+    plain = {p["id"]: p for p in run_match(_stage(3200, {"mate": (30.0, 5500), "fooled": (60.0, 5900)}),
+                                           tmp_path / "off", log=quiet)["photos"]}
+    assert plain["fooled"]["start"]["Temperature"] != 3200  # off by default
+
+
+def test_detected_faces_stop_brightening_a_frame_whose_faces_are_already_bright(tmp_path, monkeypatch):
+    """Outdoor saree run 20261004-014646: colour-picked skin said the close-ups were
+    darker, the faces were 10-16 L* brighter. Faces found without --face-skin win."""
+    def reading(path):
+        return (50.0, 14.0, 23.0) if Path(path).name == "reference.jpg" else (64.0, 14.0, 23.0)
+    monkeypatch.setattr(workflow.measure_stage, "face_reading", reading)
+    (p,) = run_match(_ceremony({"crowd": -0.8}), tmp_path, log=quiet)["photos"]
+    assert p.get("shoot_tone") is None and p["final"]["Exposure2012"] <= workflow.SAME_SHOOT_EV
+    assert p["face"]["L"] == 64.0 and p["skin_vs_reference"] is not None
+
+
+def test_without_a_face_found_the_shoot_is_evened_as_before(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow.measure_stage, "face_reading", lambda path: None)
+    (p,) = run_match(_ceremony({"crowd": -0.8}), tmp_path, log=quiet)["photos"]
+    assert "tone_from_shoot" in p["flags"] and p["final"]["Exposure2012"] > 0.3 and "face" not in p
+
+
+def test_a_shoot_frame_stopped_at_the_exposure_limit_is_flagged():
+    from engine.solver import Options
+    def frame(final_ev, flags=(), same=True):
+        return {"same_shoot": same, "extra_flags": list(flags), "start": {"Exposure2012": -0.05},
+                "final": {"Exposure2012": final_ev}, "options": Options(tone_limits=(workflow.SAME_SHOOT_EV, 0.0))}
+    assert workflow._at_exposure_cap(frame(0.25))  # bridal 00912: -0.05 + 0.3
+    assert not workflow._at_exposure_cap(frame(0.1))
+    assert not workflow._at_exposure_cap(frame(0.55, ["tone_from_shoot"]))  # moved on by the shoot tone step
+    assert not workflow._at_exposure_cap(frame(0.25, same=False))
+
+
+def test_auto_white_version_is_not_copied():
+    look, _ = split({**REF_SETTINGS, "AutoWhiteVersion": 2})
+    assert "AutoWhiteVersion" not in look
+
+
+def _with_clothes_mask(settings):
+    return {**settings, "MaskGroupBasedCorrections": [
+        {"CorrectionName": "Mask 2", "What": "Correction", "LocalSaturation": -0.2, "LocalHighlights2012": -0.2,
+         "CorrectionMasks": [{"What": "Mask/Image", "MaskSubType": 0, "MaskName": "Person 1 - Clothes",
+                              "MaskInverted": False}]}]}
+
+
+def test_copy_masks_copies_the_clothes_masks_saturation_as_a_people_mask(tmp_path):
+    """Bridal detail run 20261004-015614: the saree was ~20% louder than the
+    reference's, whose clothes mask had Saturation -20."""
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=_with_clothes_mask(REF_SETTINGS))
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    (p,) = run_match(lr, tmp_path, copy_masks=True, log=quiet)["photos"]
+    assert lr.mask_calls == [("t", "people", {"LocalSaturation": -20.0})]  # Saturation only: faces are in it too
+    assert p["masks"] == {"people": {"LocalSaturation": -20.0}}
+
+
+def test_a_clothes_mask_that_drains_the_faces_is_halved_then_removed(tmp_path, monkeypatch):
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=_with_clothes_mask(REF_SETTINGS))
+    lr = FakeLightroom({"ref": ref, "t": photo(capture(make_scene(seed=1)[4:, 2:], 4000), "DSC0002.ARW")}, active="ref")
+    chroma = iter([27.0, 22.0, 24.0])  # before, at -20 (drained), at -10 (still drained)
+    monkeypatch.setattr(workflow, "_face_chroma", lambda path: next(chroma))
+    (p,) = run_match(lr, tmp_path, copy_masks=True, log=quiet)["photos"]
+    assert [c[2] for c in lr.mask_calls] == [{"LocalSaturation": -20.0}, {"LocalSaturation": -10.0},
+                                            {"LocalSaturation": 0.0}]
+    assert "masks" not in p
