@@ -456,8 +456,10 @@ def _shoot(target_time, camera="Sony A7 IV"):
     return FakeLightroom({"ref": ref, "close": close}, active="ref")
 
 
-def test_a_close_up_from_the_same_shoot_keeps_the_references_exposure(tmp_path):
-    report = run_match(_shoot(600.0), tmp_path, log=quiet)
+@pytest.mark.parametrize("seconds", [600.0, 5 * 3600.0])
+def test_a_close_up_from_the_same_shoot_keeps_the_references_exposure(tmp_path, seconds):
+    # A wedding stage is lit the same for hours: a frame 5 h later is still the same shoot.
+    report = run_match(_shoot(seconds), tmp_path, log=quiet)
     (p,) = report["photos"]
     assert "same_shoot" in p["flags"]
     assert abs(p["final"]["Exposure2012"] - REF_SETTINGS["Exposure2012"]) <= 0.3 + 1e-6
@@ -466,7 +468,7 @@ def test_a_close_up_from_the_same_shoot_keeps_the_references_exposure(tmp_path):
     assert not {"not_converged", "tone_limited"} & set(p["flags"])
 
 
-@pytest.mark.parametrize("time, camera", [(5 * 3600.0, "Sony A7 IV"), (600.0, "Canon R6"), (None, "Sony A7 IV")])
+@pytest.mark.parametrize("time, camera", [(9 * 3600.0, "Sony A7 IV"), (600.0, "Canon R6"), (None, "Sony A7 IV")])
 def test_other_shoots_are_matched_on_brightness(tmp_path, time, camera):
     report = run_match(_shoot(time, camera), tmp_path, log=quiet)
     (p,) = report["photos"]
@@ -477,9 +479,9 @@ def test_other_shoots_are_matched_on_brightness(tmp_path, time, camera):
 def test_brighter_content_is_only_partly_darkened_to_the_references_histogram(tmp_path, monkeypatch):
     import engine.workflow as wf
     monkeypatch.setattr(wf, "CONTENT_KEEP", 0.0)
-    full = run_match(_shoot(5 * 3600.0), tmp_path / "full", log=quiet)["photos"][0]
+    full = run_match(_shoot(8 * 3600.0), tmp_path / "full", log=quiet)["photos"][0]
     monkeypatch.setattr(wf, "CONTENT_KEEP", 0.5)
-    part = run_match(_shoot(5 * 3600.0), tmp_path / "part", log=quiet)["photos"][0]
+    part = run_match(_shoot(8 * 3600.0), tmp_path / "part", log=quiet)["photos"][0]
     assert part["final"]["Exposure2012"] > full["final"]["Exposure2012"] + 0.2
     assert part["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"]  # still darkened somewhat
 
@@ -505,7 +507,7 @@ def test_a_raw_file_from_a_jpeg_references_shoot_is_held_close(tmp_path):
 
 
 def test_a_raw_file_from_another_shoot_keeps_the_wide_limits(tmp_path):
-    report = run_match(_jpeg_ref_and_raw(5 * 3600.0), tmp_path, log=quiet)
+    report = run_match(_jpeg_ref_and_raw(9 * 3600.0), tmp_path, log=quiet)
     (p,) = report["photos"]
     assert "same_shoot" not in p["flags"] and "different_file_type" in p["flags"]
     moved = max(abs(p["final"][k] - p["start"][k]) for k in ("Shadows2012", "Highlights2012", "Whites2012", "Blacks2012"))
@@ -535,7 +537,7 @@ def test_a_raw_from_the_same_shoot_keeps_its_white_balance_close(tmp_path):
 
 
 def test_a_raw_from_another_shoot_can_move_its_white_balance_further(tmp_path):
-    report = run_match(_shoot_off_wb(5 * 3600.0), tmp_path, log=quiet)
+    report = run_match(_shoot_off_wb(9 * 3600.0), tmp_path, log=quiet)
     (p,) = report["photos"]
     assert "same_shoot" not in p["flags"]
     assert abs(_mired_move(p)) > 20
@@ -615,7 +617,7 @@ def test_the_references_own_white_balance_choice_is_carried_to_its_shoot(tmp_pat
 
 
 def test_a_later_photo_can_reach_the_references_white_balance(tmp_path):
-    report = run_match(_stage(3000, {"mate": (30.0, 5500), "later": (4 * 3600.0, 5500)}), tmp_path, log=quiet)
+    report = run_match(_stage(3000, {"mate": (30.0, 5500), "later": (8 * 3600.0, 5500)}), tmp_path, log=quiet)
     later = next(p for p in report["photos"] if p["id"] == "later")
     assert "wb_offset_from_reference" not in later["flags"]
     assert later["start"]["Temperature"] == 5500  # its own camera reading
@@ -630,7 +632,7 @@ def test_a_reference_near_its_camera_reading_carries_nothing(tmp_path):
 
 
 def test_without_a_photo_from_the_references_minutes_nothing_is_carried(tmp_path):
-    report = run_match(_stage(3000, {"later": (4 * 3600.0, 5500)}), tmp_path, log=quiet)
+    report = run_match(_stage(3000, {"later": (8 * 3600.0, 5500)}), tmp_path, log=quiet)
     assert report["reference_wb_offset"] is None
     (p,) = report["photos"]
     assert abs(_mired(p["final"]["Temperature"]) - _mired(5500)) <= 80 + 0.5  # the usual limit
@@ -767,3 +769,46 @@ def test_the_report_traces_every_render_of_the_solve(tmp_path):
     assert p["trace"][0]["Temperature"] == p["start"]["Temperature"]
     assert {"error", "a", "b", "p50", "skin_a", "skin_b"} <= set(p["trace"][0])
     assert p["trace"][-1]["error"] <= p["trace"][0]["error"]
+
+
+def _colourful(scene, k):
+    gray = scene.mean(axis=-1, keepdims=True)
+    return np.clip(gray + k * (scene - gray), 0, None)
+
+
+def _colour_pair(k):
+    """A reference with Vibrance +20 and a frame of the same light whose colours are k times stronger."""
+    ref = photo(capture(make_scene(seed=0), 5500), "A.ARW", settings=dict(REF_SETTINGS, Vibrance=20, Saturation=3))
+    t = photo(capture(_colourful(make_scene(seed=1)[4:, 2:], k), 5500), "B.ARW")
+    return FakeLightroom({"ref": ref, "t": t}, active="ref")
+
+
+def test_a_photo_much_more_colourful_than_the_reference_gets_calmer_colour(tmp_path):
+    lr = _colour_pair(2.0)
+    (p,) = run_match(lr, tmp_path, log=quiet)["photos"]
+    chroma = p["calmed_colour"]
+    assert "calmer_colour" in p["flags"]
+    assert chroma["chroma_after"]["mean"] < chroma["chroma_before"]["mean"]
+    assert abs(chroma["chroma_after"]["top"] - chroma["chroma_reference"]["top"]) < abs(
+        chroma["chroma_before"]["top"] - chroma["chroma_reference"]["top"])
+    settings = lr.photos["t"]["settings"]
+    assert settings["Vibrance"] < 20 and settings["Saturation"] < 3  # the reference's own values, lowered
+    assert settings["Vibrance"] >= 20 - 15 and settings["Saturation"] >= 3 - 15
+    assert p["look_settings"] == {"Vibrance": settings["Vibrance"], "Saturation": settings["Saturation"]}
+    assert p["look_note"].startswith("calmer colour")
+
+
+@pytest.mark.parametrize("k", [1.0, 0.5])
+def test_colour_that_is_not_much_stronger_than_the_reference_is_left_alone(tmp_path, k):
+    lr = _colour_pair(k)
+    (p,) = run_match(lr, tmp_path, log=quiet)["photos"]
+    assert "calmer_colour" not in p["flags"] and p["calmed_colour"] is None
+    settings = lr.photos["t"]["settings"]
+    assert settings["Vibrance"] == 20 and settings["Saturation"] == 3  # never raised either
+
+
+def test_colour_is_not_calmed_when_only_white_balance_is_asked_for(tmp_path):
+    lr = _colour_pair(2.0)
+    (p,) = run_match(lr, tmp_path, color_only=True, log=quiet)["photos"]
+    assert "calmer_colour" not in p["flags"]
+    assert lr.photos["t"]["settings"]["Vibrance"] == 20

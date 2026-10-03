@@ -450,6 +450,140 @@ def describe(offsets):
     return ", ".join(notes[:5])
 
 
+# -- one shared grade from an outside reference -------------------------------
+# A reference from outside the catalog (someone else's photo, an export with
+# no original) has no sliders and no unedited twin to compare with, so its
+# grade is read from its pixels: the shape of its tone curve, how saturated it
+# is, the tint of its shadows and highlights, and the colour families both it
+# and the photos show. One grade is solved for all the photos together, so the
+# set stays consistent; each photo's own light was matched before.
+
+STYLE_LIMIT = 40.0  # saturation and split toning
+# Tone and the HSL bands follow what's in the picture as much as the grade (a
+# scene without sky has another histogram), so they move less and count less.
+STYLE_TONE_LIMIT = 20.0
+STYLE_BAND_LIMIT = 25.0
+STYLE_TONE_WEIGHT = 0.6
+# Which parts of the tone curve's shape count: the black and white ends (a
+# faded or crushed black, a soft highlight) carry the grade; the middle of
+# the histogram is mostly content.
+STYLE_SHAPE = {5: 1.0, 15: 0.3, 30: 0.0, 70: 0.0, 85: 0.3, 95: 1.0}
+STYLE_BAND_WEIGHT = 0.3
+STYLE_SPLIT_LIMIT = 30.0
+STYLE_LEVEL_WEIGHT = 1.5  # holds each photo's mid-tone brightness where the light stage put it
+STYLE_REGULARIZE = 1e-4
+
+
+def _style_tone(ref, base):
+    """Tone rows: the curve's shape (each percentile against the median), and
+    the median itself held at the photo's own (base) level. Exposure differs
+    per photo; only the shape belongs to the grade."""
+    n = len(TONE_PERCENTILES)
+    mid = TONE_PERCENTILES.index(50)
+    rows = [k for k in range(n) if k != mid]
+    T = np.zeros((n, n))
+    for i, k in enumerate(rows):
+        T[i, k], T[i, mid] = 1.0, -1.0
+    T[n - 1, mid] = 1.0
+    c = np.zeros(n)
+    c[n - 1] = base["tone"]["p50"] - ref["tone"]["p50"]
+    w = np.array([STYLE_TONE_WEIGHT * STYLE_SHAPE[TONE_PERCENTILES[k]] for k in rows] + [STYLE_LEVEL_WEIGHT])
+    return T, c, w
+
+
+def style_residual(ref, base, cur, plan):
+    """Residual of one photo against an outside reference (plan.tone must be on)."""
+    r, w = residual(ref, cur, plan)
+    n = len(TONE_PERCENTILES)
+    T, c, tw = _style_tone(ref, base)
+    w = w.copy()
+    w[n + 2:n + 2 + 3 * len(plan.bands)] *= STYLE_BAND_WEIGHT
+    return np.concatenate([T @ r[:n] - c, r[n:]]), np.concatenate([tw, w[n:]])
+
+
+def style_error(ref, base, cur, plan):
+    r, w = style_residual(ref, base, cur, plan)
+    return float(np.sqrt((w * r**2).sum() / w.sum()))
+
+
+def _style_jacobian(ref, base, plan, vars_):
+    J0 = prior_jacobian(ref, plan)
+    n = len(TONE_PERCENTILES)
+    T, _, _ = _style_tone(ref, base)
+    J0 = np.vstack([T @ J0[:n], J0[n:]])
+    J = np.zeros((J0.shape[0], len(vars_)))
+    for j, v in enumerate(plan.variables()):
+        J[:, vars_.index(v)] = J0[:, j]
+    return J
+
+
+def _style_limits(vars_):
+    return np.array([STYLE_BAND_LIMIT if v in BAND_KEYS else STYLE_TONE_LIMIT if v in TONE_KEYS else STYLE_LIMIT
+                     for v in vars_])
+
+
+def _style_limit(x, vars_):
+    lim = _style_limits(vars_)
+    return _limit(np.clip(x, -lim, lim), vars_, limit=STYLE_LIMIT, split_limit=STYLE_SPLIT_LIMIT)
+
+
+def style_variables(plans):
+    used = set().union(*(p.variables() for p in plans.values())) if plans else set()
+    return [v for v in VARIABLES if v in used]
+
+
+def propose_style(ref, bases, plans, history, tolerance=1.0, max_iterations=6):
+    """Next shared grade to render on every photo, or the best found once done.
+
+    bases / plans: per photo id, its look after the light stage and what to
+    match on it. history: [{"offsets": {...}, "looks": {id: look}}, ...],
+    oldest first; the first entry has no offsets."""
+    vars_ = style_variables(plans)
+    pids = list(plans)
+    xs = [_vector(h["offsets"], vars_) for h in history]
+    res = {pid: [style_residual(ref, bases[pid], h["looks"][pid], plans[pid]) for h in history] for pid in pids}
+    errors = [float(np.mean([np.sqrt((res[pid][0][1] * res[pid][k][0] ** 2).sum() / res[pid][0][1].sum())
+                             for pid in pids])) for k in range(len(history))]
+    best = int(np.argmin(errors))
+    iterations = len(history) - 1
+
+    def done():
+        x = xs[best]
+        lim = _style_limits(vars_)
+        limited = bool(np.any(np.abs(x) >= lim - 0.5)) and errors[best] >= tolerance
+        return LookProposal(_offsets(x, vars_), True, errors[-1], errors[best], iterations, limited)
+
+    if not vars_ or errors[-1] < tolerance or iterations >= max_iterations:
+        return done()
+    if len(errors) > 1 and errors[-1] > errors[best] * 1.02:
+        # Got worse: back off halfway toward the best render.
+        x_next = (xs[-1] + xs[best]) / 2
+        if np.abs(x_next - xs[-1]).max() < 0.5:
+            return done()
+        return LookProposal(_offsets(x_next, vars_), False, errors[-1], errors[best], iterations)
+
+    lhs = STYLE_REGULARIZE * np.eye(len(vars_))
+    rhs = -STYLE_REGULARIZE * xs[-1]
+    for pid in pids:
+        rs = [r for r, _ in res[pid]]
+        w = res[pid][0][1]
+        J = _style_jacobian(ref, bases[pid], plans[pid], vars_)
+        for i in range(1, len(xs)):  # Broyden updates from the renders so far
+            dx, dr = xs[i] - xs[i - 1], rs[i] - rs[i - 1]
+            denom = dx @ dx
+            if denom > 1e-6:
+                J = J + np.outer(dr - J @ dx, dx) / denom
+        W = np.diag(w / w.sum() / len(pids))
+        lhs += J.T @ W @ J
+        rhs -= J.T @ W @ rs[-1]
+    lhs += 1e-4 * np.diag(np.diag(lhs))
+    dx = np.clip(np.linalg.solve(lhs, rhs), -STEP_CAP, STEP_CAP)
+    x_next = _style_limit(xs[-1] + dx, vars_)
+    if np.abs(x_next - xs[-1]).max() < 0.5:
+        return done()
+    return LookProposal(_offsets(x_next, vars_), False, errors[-1], errors[best], iterations)
+
+
 # -- pixel-paired comparison (grade fit on an original and its edited copy) ----
 
 PAIR_ZONES = 5  # lightness zones of 20 L* each

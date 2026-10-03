@@ -56,7 +56,7 @@ Paste or point a new Claude chat at this file to continue the project. It covers
   - `is_baked` (look.py) treats any real Lightroom edit as not baked: Clarity, Dehaze, Texture, colour grading, calibration, point colours, or tone curves.
 - **macOS JSON:** Lua `%c` matches bytes 0x80–0x9F in a UTF-8 locale and corrupted non-ASCII text. `Json.lua` uses an explicit control-byte pattern.
 
-**Same shoot** (same camera, same file type, `captureTime` within 3 h): `same_shoot`.
+**Same shoot** (same camera, same file type, `captureTime` within 6 h; it was 3 h until a close-up shot 3.6 h later was darkened to a wide reference's histogram): `same_shoot`.
 - Exposure stays within ±0.3 EV of the reference's, and the tone sliders are fixed. The camera already evened out the light.
 - The photo is judged on colour only. Earlier, content-driven exposure matches made photos too dark.
 
@@ -74,6 +74,10 @@ Paste or point a new Claude chat at this file to continue the project. It covers
   - Later photos may move far enough to reach the reference's value.
   - The report shows `reference_wb_offset`.
 - Why: DSC01303 was graded at 2662 K while the camera said 5550 K. DSC01318, shot 28 s later, stayed orange.
+
+**Face colour** (`--skin`, after the solve): a photo whose skin (a*, b*) is more than 2 off the reference's gets up to 2 small Temperature/Tint moves from the faces (at most 15 mired, Tint 10 per pass), re-rendered and kept only if the faces got closer without the neutrals drifting more than 1.5 ΔE: `color_from_skin`, `skin_color`. Photos with `wb_from_shoot` are left alone. The report's `trace` lists every render of the solve.
+
+**Calmer colour:** the reference's Vibrance/Saturation/HSL are copied to every photo, so a close-up full of gold and red ends much more colourful than a wide reference. A photo whose mean and top chroma are both 1.15x the reference's or more gets Vibrance and Saturation lowered (never raised, at most 15 each): `calmer_colour`, `calmed_colour`. Not applied with `--color-only`, a fitted or outside-reference grade, or `--no-look`.
 
 **Learning after a catalog switch:**
 - Photo ids are local to a catalog, so the plugin's `get_settings` looks only in the open catalog and returns file names.
