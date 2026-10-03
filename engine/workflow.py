@@ -81,6 +81,29 @@ SHOOT_OUTLIER_MIN_PHOTOS = 3
 # wb_from_reference); off by default until replayed real runs show it helps.
 SHOOT_HOLD_MIRED = 0.0
 SHOOT_HOLD_TINT = 0.0
+# A shoot is not always evened out by the camera: in a ceremony shot on manual
+# exposure, frames toward the stage lights come out brighter and frames of the crowd
+# darker (run 20261003-230103: mid-tones 52 and 72-76 against the reference's 61,
+# all at its exposure). With --even-shoot-tone, a frame from the reference's shoot is
+# moved toward the reference's mid-tone brightness, keeping SHOOT_TONE_KEEP of the gap
+# as content (a close-up of cream clothes stays brighter than a crowd), at most
+# SHOOT_TONE_EV from the reference's exposure. A frame more than SHOOT_TONE_MAX_GAP
+# away at the reference's exposure is another kind of scene (candles at night) and
+# is left alone. Where faces can be read, they have the last word: a frame isn't
+# brightened when its faces are already as bright as the reference's (or brighter),
+# nor darkened when they are as dark (or darker), and a change that moves faces
+# further from the reference's is put back. A bright frame that ends much flatter
+# than the reference (its Shadows lift turned a light backdrop into haze) also gets
+# that lift halved. Each change is re-rendered and kept only if it brought the
+# frame closer. The kept share is fitted to the user's own fixes: DSC02201 (they set
+# Exposure -0.3, this lands near -0.35) and DSC00694 (nudged down 0.3).
+SHOOT_TONE_KEEP = 0.35
+SHOOT_TONE_DEADBAND = 3.0
+SHOOT_TONE_EV = 0.6
+SHOOT_TONE_MAX_GAP = 20.0
+SHOOT_TONE_PASSES = 2
+SHOOT_TONE_FLAT = 0.75  # p25..p75 spread below this share of the reference's reads as hazy
+SHOOT_TONE_SHADOWS = 0.5  # share of the Shadows lift kept on a hazy bright frame
 # Lightroom doesn't keep a raw's as-shot white balance once it is changed, so the
 # reference's is read off a photo shot within these minutes with the same camera
 # (same light). When the reference was set more than SAME_SHOOT_MIRED away from
@@ -371,6 +394,7 @@ def run_match(
     refit=False,
     hold_shoot_wb=False,
     skin_hue=False,
+    even_shoot_tone=False,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
@@ -395,6 +419,9 @@ def run_match(
         default until real runs (engine/replay.py bench) show it helps.
     skin_hue: with `skin`, faces redder than the reference's get a small
         Orange hue change (SKIN_HUE_DEADBAND). Off by default.
+    even_shoot_tone: photos from the reference's shoot are moved toward its
+        mid-tone brightness, and hazy bright ones get less Shadows lift
+        (SHOOT_TONE_KEEP). Off by default.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -623,6 +650,9 @@ def run_match(
             state[item["id"]]["preview"] = item["path"]
             state[item["id"]]["final_metrics"] = measure_file(item["path"], hint)
 
+    if even_shoot_tone:
+        _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
+
     if skin:
         _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
         _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
@@ -731,6 +761,7 @@ def run_match(
             "skin_color": s.get("skin_color"),
             "skin_color_note": s.get("skin_color_note"),
             "skin_hue": s.get("skin_hue"),
+            "shoot_tone": s.get("shoot_tone"),
             "calmed_colour": s.get("calmed_colour"),
             "trace": _trace(s, ref_metrics),
             "flags": s["flags"] + s["extra_flags"],
@@ -828,6 +859,115 @@ def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, wa
             undo.append({"id": pid, "settings": _corrective_settings(old[pid])})
     if undo:
         _apply(bridge, undo, warnings, log)
+
+
+def _spread(m):
+    return m.L["p75"] - m.L["p25"]
+
+
+def _face_gap(ref_metrics, m, s):
+    """How much brighter (L*) the faces are than the reference's, or None when
+    what reads as skin can't be trusted as faces."""
+    if "skin_not_matched" in s["extra_flags"] or not (_reliable_skin(ref_metrics) and _reliable_skin(m)):
+        return None
+    if _false_skin(ref_metrics, m):
+        return None
+    return m.skin_L - ref_metrics.skin_L
+
+
+def _even_shoot_tone(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print):
+    """Even out the brightness of photos from the reference's shoot (see
+    SHOOT_TONE_KEEP): exposure toward the reference's mid-tones, keeping part of
+    the gap as content, and less Shadows lift on a bright frame that went hazy.
+    A change that doesn't bring the frame closer is put back."""
+    ref_p50, ref_spread = ref_metrics.L["p50"], _spread(ref_metrics)
+    live = {}
+    for pid, s in state.items():
+        if not s["same_shoot"] or s["options"].color_only:
+            continue
+        first = Metrics.from_dict(s["history"][0]["metrics"])
+        gap = first.L["p50"] - ref_p50
+        if abs(gap) > SHOOT_TONE_MAX_GAP:
+            continue
+        target = ref_p50 + SHOOT_TONE_KEEP * gap
+        m = s["final_metrics"]
+        face_gap = _face_gap(ref_metrics, m, s)
+        if face_gap is not None and (target > m.L["p50"] and face_gap > -SKIN_ANCHOR_DEADBAND
+                                     or target < m.L["p50"] and face_gap < SKIN_ANCHOR_DEADBAND):
+            target = m.L["p50"]  # the faces already say this frame is bright (or dark) enough
+        hazy = (gap > 0 and _spread(m) < SHOOT_TONE_FLAT * ref_spread
+                and s["final"]["Shadows2012"] > 0)
+        if abs(m.L["p50"] - target) < SHOOT_TONE_DEADBAND and not hazy:
+            continue
+        live[pid] = {"target": target, "hazy": hazy, "slope": None,
+                     "before": {"Exposure2012": s["final"]["Exposure2012"], "Shadows2012": s["final"]["Shadows2012"],
+                                "p50": round(m.L["p50"], 1), "spread": round(_spread(m), 1)}}
+    for n in range(SHOOT_TONE_PASSES):
+        moves = {}
+        for pid, t in live.items():
+            s = state[pid]
+            m, sliders = s["final_metrics"], dict(s["final"])
+            if t["hazy"] and n == 0:
+                sliders["Shadows2012"] = round(sliders["Shadows2012"] * SHOOT_TONE_SHADOWS, 1)
+            need = t["target"] - m.L["p50"]
+            if abs(need) >= SHOOT_TONE_DEADBAND or t["hazy"] and n == 0:
+                if t["slope"]:
+                    ev = need / t["slope"]
+                else:
+                    ev = float(np.log2(_luminance(t["target"]) / max(_luminance(m.L["p50"]), 1e-6)))
+                base = s["start"]["Exposure2012"]
+                sliders["Exposure2012"] = round(float(np.clip(sliders["Exposure2012"] + ev, base - SHOOT_TONE_EV,
+                                                              base + SHOOT_TONE_EV)), 2)
+            if sliders != s["final"]:
+                moves[pid] = sliders
+        if not moves:
+            break
+        _apply(bridge, [{"id": pid, "settings": _corrective_settings(sl)} for pid, sl in moves.items()], warnings, log)
+        tone_dir = out_dir / ("shoot_tone" if n == 0 else f"shoot_tone_{n + 1}")
+        tone_dir.mkdir(exist_ok=True)
+        items = [{"id": pid, "path": str(tone_dir / f"{_safe(state[pid]['photo'])}.jpg")} for pid in moves]
+        bridge.render(items, size=size)
+        undo = []
+        for item in items:
+            pid = item["id"]
+            s, t = state[pid], live[pid]
+            old, m = s["final_metrics"], measure_file(item["path"], hint)
+            closer = abs(m.L["p50"] - t["target"]) < abs(old.L["p50"] - t["target"])
+            settled = abs(m.L["p50"] - t["target"]) < SHOOT_TONE_DEADBAND
+            deeper = abs(_spread(m) - ref_spread) < abs(_spread(old) - ref_spread)
+            flatter = abs(_spread(m) - ref_spread) > abs(_spread(old) - ref_spread) + 1.0
+            faces_before, faces_after = _face_gap(ref_metrics, old, s), _face_gap(ref_metrics, m, s)
+            faces_off = (faces_before is not None and faces_after is not None
+                         and abs(faces_after) > max(abs(faces_before), SKIN_ANCHOR_DEADBAND))
+            if (closer or settled and deeper) and not flatter and not faces_off:
+                d_ev = moves[pid]["Exposure2012"] - s["final"]["Exposure2012"]
+                if abs(d_ev) >= 0.05 and moves[pid]["Shadows2012"] == s["final"]["Shadows2012"]:
+                    t["slope"] = (m.L["p50"] - old.L["p50"]) / d_ev
+                    if t["slope"] <= 1.0:
+                        t["slope"] = None
+                delta = {k: moves[pid][k] - s["final"][k] for k in ("Exposure2012", "Shadows2012")}
+                s["final"] = moves[pid]
+                s["matched"] = {**s["matched"], **{k: round(s["matched"][k] + v, 2) for k, v in delta.items()}}
+                s["final_metrics"], s["preview"] = m, item["path"]
+                s["shoot_tone"] = {"before": t["before"], "target_p50": round(t["target"], 1),
+                                   "after": {"Exposure2012": s["final"]["Exposure2012"],
+                                             "Shadows2012": s["final"]["Shadows2012"],
+                                             "p50": round(m.L["p50"], 1), "spread": round(_spread(m), 1)},
+                                   "reference": {"p50": round(ref_p50, 1), "spread": round(ref_spread, 1)}}
+                if "tone_from_shoot" not in s["extra_flags"]:
+                    s["extra_flags"].append("tone_from_shoot")
+            else:
+                undo.append({"id": pid, "settings": _corrective_settings(s["final"])})
+                t["hazy"] = False
+                t["target"] = s["final_metrics"].L["p50"]  # nothing more to try on this photo
+        if undo:
+            _apply(bridge, undo, warnings, log)
+    for pid in live:
+        st = state[pid].get("shoot_tone")
+        if st:
+            log(f"{state[pid]['photo']['fileName']}: evened with its shoot (mid-tones {st['before']['p50']} -> "
+                f"{st['after']['p50']}, reference {st['reference']['p50']}; Exposure {st['after']['Exposure2012']:+.2f}, "
+                f"Shadows {st['after']['Shadows2012']:+.0f})")
 
 
 def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint, ref_skin_chroma=None):
@@ -2052,6 +2192,8 @@ def main(argv=None):
                    help="with --skin: faces redder than the reference's get a small Orange hue change")
     m.add_argument("--hold-shoot-wb", action="store_true",
                    help="photos from the reference's shoot keep its white balance (when not on As Shot)")
+    m.add_argument("--even-shoot-tone", action="store_true",
+                   help="photos from the reference's shoot are evened toward its brightness, hazy ones less lifted")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -2088,7 +2230,8 @@ def main(argv=None):
                                look=not args.no_look, look_strength=args.look_strength,
                                look_per_photo=args.look_per_photo, original=args.original,
                                grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
-                               hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue)
+                               hold_shoot_wb=args.hold_shoot_wb, skin_hue=args.skin_hue,
+                               even_shoot_tone=args.even_shoot_tone)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,
