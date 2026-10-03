@@ -446,16 +446,28 @@ def describe(offsets):
 PAIR_ZONES = 5  # lightness zones of 20 L* each
 PAIR_NEUTRAL_CHROMA = 8.0
 PAIR_MIN_FRACTION = 0.003
+# The picture is also split into a grid of tiles, so an edit brushed onto one
+# area of the copy shows up as a few tiles that disagree with the rest (and
+# can be down-weighted) instead of skewing every class a little.
+PAIR_TILES = 3
+PAIR_MIN_TILES = 3  # tiles a class needs to count fully
 
 
-def paired_classes(rgb, lab):
+def paired_classes(rgb, lab, shape=None):
     """Group the pixels of the original's render into lightness zone x colour
-    family (neutral or one of the 8 HSL bands). Returns (labels, kept, fractions)."""
+    family (neutral or one of the 8 HSL bands) x tile of the picture (shape:
+    (height, width) of the flattened image; None for no tiles).
+    Returns (labels, kept, fractions)."""
     L, c = lab[:, 0], np.hypot(lab[:, 1], lab[:, 2])
     zone = np.clip((L / (100 / PAIR_ZONES)).astype(int), 0, PAIR_ZONES - 1)
     family = np.where(c < PAIR_NEUTRAL_CHROMA, len(BANDS), band_weights(hsv_hue(rgb)).argmax(axis=1))
-    labels = family * PAIR_ZONES + zone
-    counts = np.bincount(labels, minlength=(len(BANDS) + 1) * PAIR_ZONES)
+    tile = np.zeros(len(L), dtype=int)
+    if shape is not None:
+        h, w = shape
+        rows, cols = np.divmod(np.arange(len(L)), w)
+        tile = (rows * PAIR_TILES // h) * PAIR_TILES + cols * PAIR_TILES // w
+    labels = (family * PAIR_ZONES + zone) * PAIR_TILES ** 2 + tile
+    counts = np.bincount(labels, minlength=(len(BANDS) + 1) * PAIR_ZONES * PAIR_TILES ** 2)
     kept = [k for k in range(len(counts)) if counts[k] >= PAIR_MIN_FRACTION * len(labels)]
     return labels, kept, {k: counts[k] / len(labels) for k in kept}
 
@@ -464,21 +476,42 @@ def band_fractions(labels, kept, fractions):
     """Share of the picture in each HSL band (chromatic classes only)."""
     out = {b: 0.0 for b in BANDS}
     for k in kept:
-        family = k // PAIR_ZONES
+        family = k // PAIR_TILES ** 2 // PAIR_ZONES
         if family < len(BANDS):
             out[BANDS[family]] += fractions[k]
     return out
 
 
 def paired_residual(candidate_lab, ref_lab, labels, kept, fractions):
-    """Per class, mean Lab of the candidate minus the reference over the same
-    pixels, scaled so that |r|^2 is the class-size-weighted mean squared error."""
-    r = []
+    """Per class (lightness zone x colour family), the difference between the
+    candidate and the reference over the same pixels, scaled so that |r|^2 is
+    the class-size-weighted mean squared error.
+
+    With tiles, each class's difference is the median over the tiles it
+    appears in: an edit brushed onto part of the copy (a darkened sky, a
+    brightened car) is outvoted instead of skewing the global sliders."""
+    tiles = PAIR_TILES ** 2
+    groups = {}
     for k in kept:
-        sel = labels == k
-        d = candidate_lab[sel].mean(axis=0) - ref_lab[sel].mean(axis=0)
-        r.extend(np.sqrt(fractions[k]) * d)
+        groups.setdefault(k // tiles, []).append(k)
+    r = []
+    for cls in sorted(groups):
+        diffs = np.array([candidate_lab[labels == k].mean(axis=0) - ref_lab[labels == k].mean(axis=0)
+                          for k in groups[cls]])
+        # A colour found in only one or two areas can't be outvoted, so it
+        # counts for less: it may be exactly the area that was edited.
+        weight = sum(fractions[k] for k in groups[cls]) * min(1.0, len(groups[cls]) / PAIR_MIN_TILES)
+        r.extend(np.sqrt(weight) * np.median(diffs, axis=0))
     return np.array(r)
+
+
+def paired_class_fractions(kept, fractions):
+    """Fractions per class as paired_residual orders them (tiles merged)."""
+    tiles = PAIR_TILES ** 2
+    out = {}
+    for k in kept:
+        out[k // tiles] = out.get(k // tiles, 0.0) + fractions[k]
+    return dict(sorted(out.items()))
 
 
 def paired_error(residual, fractions):

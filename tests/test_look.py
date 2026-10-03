@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pytest
 
@@ -219,3 +220,44 @@ def test_fitted_grade_is_kept_and_reused(cropped_set, tmp_path):
     assert cropped_set.renders - renders < first["grade_fit"]["renders"]  # no fit renders the second time
     third = run_match(cropped_set, tmp_path / "c", grades_dir=grades, refit=True, log=quiet)
     assert not third["grade_fit"].get("cached")
+
+
+def test_an_approved_grade_correction_goes_to_every_photo_and_is_kept(cropped_set, tmp_path):
+    from engine.workflow import run_nudge
+    grades = tmp_path / "grades"
+    report = run_match(cropped_set, tmp_path / "a", grades_dir=grades, log=quiet)
+    before = report["grade_fit"]["look_settings"].get("HueAdjustmentOrange", 0.0)
+    run_nudge(cropped_set, tmp_path / "a", "all", {"HueAdjustmentOrange": -10.0, "Contrast2012": 5.0},
+              grade=True, grades_dir=grades)
+    for pid in ("orig", "warm", "cool"):
+        assert cropped_set.photos[pid]["settings"]["HueAdjustmentOrange"] == before - 10
+    again = run_match(cropped_set, tmp_path / "b", grades_dir=grades, log=quiet)
+    assert again["grade_fit"]["cached"]
+    assert again["grade_fit"]["look_settings"]["HueAdjustmentOrange"] == before - 10
+    refit = run_match(cropped_set, tmp_path / "c", grades_dir=grades, refit=True, log=quiet)
+    (cache,) = grades.glob("*.json")
+    assert "corrections" not in json.loads(cache.read_text())
+    assert not refit["grade_fit"].get("cached")
+
+
+def test_grade_nudge_takes_only_look_sliders(cropped_set, tmp_path):
+    from engine.workflow import run_nudge
+    run_match(cropped_set, tmp_path, log=quiet)
+    with pytest.raises(ValueError):
+        run_nudge(cropped_set, tmp_path, "all", {"Exposure2012": 0.2}, grade=True)
+
+
+def test_a_brushed_edit_in_the_copy_is_found_and_outvoted(tmp_path):
+    original = capture(sky_scene(0, size=160), 5500)
+    graded = render(original, STRONG_LOOK)
+    W = graded.shape[1]
+    graded[:, : W // 3] = np.clip(graded[:, : W // 3] * 1.35 + 0.05, 0, 1)  # brightened by hand on the left
+    lr = FakeLightroom({"ref": photo(srgb_to_linear(graded), "IMG_1964 copy.jpg"),
+                        "orig": photo(original, "IMG_1964.JPG"), **scenes()}, active="ref")
+    report = run_match(lr, tmp_path, log=quiet)
+    fit = report["grade_fit"]
+    assert "left" in fit["unmatched"]
+    assert any("local edits" in w for w in report["warnings"])
+    g = fit["look_settings"]
+    assert g["SaturationAdjustmentOrange"] == pytest.approx(-30, abs=10)  # the real global edit survives
+    assert all(abs(g.get(k, 0)) <= 60 for k in look.BAND_KEYS)

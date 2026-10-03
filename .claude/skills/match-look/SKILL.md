@@ -79,6 +79,8 @@ It writes the look and the solved sliders into Lightroom. It takes a "Before Mat
   - `delta_e_before` → `delta_e_after`: the pixel difference between the original and the reference, before and after fitting. Under about 3 means the grade was recovered well. Above about 6 usually means the copy has local edits (masks, brushes, sky replacement) that global sliders can't reproduce: tell the user.
   - `note`: the biggest parts of the grade, for example "blue sat +20, contrast +15"
   - `cached`: the grade was reused from an earlier run
+  - `at_limits`: grade sliders that ended at their bound
+  - `unmatched`: regions still far off after fitting (for example "top" or "left"). These were probably edited locally in the copy (a mask or brush), so global sliders can't follow them: tell the user, and suggest an AI-mask nudge (`--mask sky`) if that region matters
 - `look_start_error` → `look_final_error` and `look_note` per photo: only when the conservative per-photo colour match ran
   - `flags`
   - `learned_adjustment`: a learned preference that was applied, if any
@@ -135,6 +137,11 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
 - Photos flagged `not_converged` with a high error often differ in **content**, not light: half the frame is foliage, or a dark interior. Look before nudging; usually they're fine or need the user's eye.
 - `look_limited` (per-photo colour match only): a colour slider hit its limit and the photo still differs, usually because the content differs. Check it before nudging.
 - Never change photos outside this run. Don't change other creative settings such as profile, grain or vignette: those stay exactly the reference's.
+- **When the user approves some photos and not others:** if the approved ones carry a look nudge the others lack, apply that same change to the whole set and to the stored grade with one command, instead of nudging photos one by one:
+  ```
+  PY -m engine.workflow nudge --run RUN --photo all --grade HueAdjustmentOrange=-20 HueAdjustmentYellow=-20
+  ```
+  `--grade` takes look sliders only. The correction is kept with the reference's grade for the next run; `--refit` drops it.
 
 Every nudge you make, and every edit the user makes later in Lightroom, is learned from at the next run. You don't need to run anything extra. To learn right away, for example before closing, run `PY -m engine.workflow learn`.
 
@@ -145,6 +152,7 @@ Keep the report short:
 - **Skin**, only with `--skin`: one line on how consistent it is across the set. Use the report's words (for example "DSC0042: greener than the reference, fixed").
 - **Flagged photos:** which photos have the yellow label, and why each needs the user's eye.
 - **What was learned:** one line, from `PY -m engine.learning show`. For example "learned from 2 edits you made last time; this camera's slider response now has 40 samples".
+- **Skipped for learning:** if the log or the report's `learned` says a run was skipped (undone, too many flags, poor grade fit), say so in one line. If the user says this run went badly, suggest `PY -m engine.workflow learn --skip` so it is never learned from.
 - **How to undo:** the "Before Match Look" snapshot on each photo (Develop ▸ Snapshots), or Edit ▸ Undo. If the summary has a snapshot `warning`, say that undo is through the History panel instead.
 
 ## After grading: record what you found
