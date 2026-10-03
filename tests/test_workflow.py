@@ -624,3 +624,62 @@ def test_without_a_photo_from_the_references_minutes_nothing_is_carried(tmp_path
     assert report["reference_wb_offset"] is None
     (p,) = report["photos"]
     assert abs(_mired(p["final"]["Temperature"]) - _mired(5500)) <= 80 + 0.5  # the usual limit
+
+
+def _portrait(seed, bright=False):
+    """A frame with a face-sized skin patch; `bright`: bright clothes and backdrop around it."""
+    s = make_scene(seed=seed)
+    if bright:
+        s = np.clip(s * 2.2, 0, 0.9)
+    s[10:50, 30:70] = (0.42, 0.24, 0.16)
+    return s
+
+
+def _portraits(bright=True, target_time=None):
+    ref = photo(capture(_portrait(0), 5500), "P1.ARW", settings=dict(REF_SETTINGS))
+    t = photo(capture(_portrait(1, bright)[4:, 2:], 5500), "P2.ARW")
+    if target_time is not None:
+        ref["captureTime"], t["captureTime"] = 0.0, target_time
+    return FakeLightroom({"ref": ref, "t": t}, active="ref")
+
+
+def test_a_bright_portrait_gets_its_exposure_from_the_faces(tmp_path):
+    plain = run_match(_portraits(), tmp_path / "plain", skin=False, log=quiet)["photos"][0]
+    report = run_match(_portraits(), tmp_path / "skin", skin=True, log=quiet)
+    (p,) = report["photos"]
+    ref_L = report["reference"]["skin"]["L"]
+    assert "exposure_from_skin" not in plain["flags"]
+    assert "exposure_from_skin" in p["flags"]
+    assert p["final"]["Exposure2012"] > plain["final"]["Exposure2012"]  # brighter than the histogram match
+    assert p["skin_exposure"]["skin_L_after"] > p["skin_exposure"]["skin_L_before"]
+    assert abs(p["skin"]["L"] - ref_L) < abs(p["skin_exposure"]["skin_L_before"] - ref_L)
+    assert p["matched"]["Exposure2012"] == p["final"]["Exposure2012"]  # not learned as a preference later
+
+
+def test_a_portrait_from_the_references_shoot_keeps_its_exposure(tmp_path):
+    report = run_match(_portraits(target_time=600.0), tmp_path, skin=True, log=quiet)
+    (p,) = report["photos"]
+    assert "same_shoot" in p["flags"] and "exposure_from_skin" not in p["flags"]
+
+
+def test_a_skin_exposure_that_doesnt_help_is_put_back(tmp_path):
+    lr = _portraits()
+    real_render = lr.render
+
+    def render(items, size=1024):
+        if any("/skin/" in i["path"] for i in items):
+            # This "Lightroom" ignores the new exposure: render as before.
+            for i in items:
+                settings = lr.photos[i["id"]]["settings"]
+                saved = settings["Exposure2012"]
+                settings["Exposure2012"] = saved - 0.5  # the move here is the 0.5 cap
+                real_render([i], size)
+                settings["Exposure2012"] = saved
+            return [i["path"] for i in items]
+        return real_render(items, size)
+
+    lr.render = render
+    report = run_match(lr, tmp_path, skin=True, log=quiet)
+    (p,) = report["photos"]
+    assert "exposure_from_skin" not in p["flags"] and p["skin_exposure"] is None
+    assert lr.photos["t"]["settings"]["Exposure2012"] == p["final"]["Exposure2012"]

@@ -74,6 +74,17 @@ SHOOT_OUTLIER_MIN_PHOTOS = 3
 # (same light). When the reference was set more than SAME_SHOOT_MIRED away from
 # it, that is the user's choice, and it is carried to the other photos.
 REF_AS_SHOT_MINUTES = 10.0
+# Matching a frame's overall brightness follows its content: a close portrait in
+# bright clothes against a bright backdrop is darkened to a crowd scene's
+# histogram, and the faces end up darker than the reference's. With --skin, a
+# photo whose faces end up more than SKIN_ANCHOR_DEADBAND L* from the reference's
+# gets its exposure set from the faces instead (at most SKIN_ANCHOR_EV stops).
+# Skin readings covering little of the frame, or far more or less colourful than
+# the reference's (fabric, henna), aren't trusted.
+SKIN_ANCHOR_DEADBAND = 3.0
+SKIN_ANCHOR_EV = 0.5
+SKIN_ANCHOR_MIN_FRACTION = 0.03
+SKIN_ANCHOR_CHROMA = 10.0
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -513,6 +524,9 @@ def run_match(
             state[item["id"]]["preview"] = item["path"]
             state[item["id"]]["final_metrics"] = measure_file(item["path"], hint)
 
+    if skin:
+        _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
+
     if per_photo_look:
         _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint)
 
@@ -588,6 +602,7 @@ def run_match(
             "look_final_error": s.get("look_final_error"),
             "look_settings": s.get("look_settings", {}),
             "look_note": s.get("look_note"),
+            "skin_exposure": s.get("skin_exposure"),
             "flags": s["flags"] + s["extra_flags"],
             "skin": t_skin,
             "skin_vs_reference": skin_model.compare(ref_skin, t_skin) if ref_skin and t_skin else None,
@@ -597,6 +612,66 @@ def run_match(
     _label_flagged(bridge, report, label)
     _write_outputs(out_dir, report)
     return report
+
+
+def _luminance(L):
+    """CIE L* to relative luminance Y."""
+    return ((L + 16) / 116) ** 3 if L > 8 else L / 903.3
+
+
+def _reliable_skin(m):
+    return m.skin_L is not None and m.skin_fraction >= SKIN_ANCHOR_MIN_FRACTION
+
+
+def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log=print):
+    """Set the exposure of photos whose faces ended up darker or brighter than
+    the reference's from the faces, not the frame (see SKIN_ANCHOR_DEADBAND).
+    A photo from the reference's shoot keeps the reference's exposure, and a
+    change that doesn't bring the skin closer is put back."""
+    if not _reliable_skin(ref_metrics):
+        return
+    ref_chroma = float(np.hypot(ref_metrics.skin_a, ref_metrics.skin_b))
+    moves = {}
+    for pid, s in state.items():
+        m = s["final_metrics"]
+        if s["same_shoot"] or s["options"].color_only or not _reliable_skin(m):
+            continue
+        if abs(float(np.hypot(m.skin_a, m.skin_b)) - ref_chroma) > SKIN_ANCHOR_CHROMA:
+            continue
+        if abs(m.skin_L - ref_metrics.skin_L) <= SKIN_ANCHOR_DEADBAND:
+            continue
+        ev = float(np.log2(_luminance(ref_metrics.skin_L) / max(_luminance(m.skin_L), 1e-6)))
+        moves[pid] = round(float(np.clip(ev, -SKIN_ANCHOR_EV, SKIN_ANCHOR_EV)), 2)
+    if not moves:
+        return
+    old = {pid: dict(state[pid]["final"]) for pid in moves}
+    for pid, ev in moves.items():
+        s = state[pid]
+        s["final"] = {**s["final"], "Exposure2012": round(s["final"]["Exposure2012"] + ev, 2)}
+    _apply(bridge, [{"id": pid, "settings": _corrective_settings(state[pid]["final"])} for pid in moves], warnings, log)
+    skin_dir = out_dir / "skin"
+    skin_dir.mkdir(exist_ok=True)
+    items = [{"id": pid, "path": str(skin_dir / f"{_safe(state[pid]['photo'])}.jpg")} for pid in moves]
+    bridge.render(items, size=size)
+    undo = []
+    for item in items:
+        pid = item["id"]
+        s = state[pid]
+        m = measure_file(item["path"], hint)
+        before_gap = abs(s["final_metrics"].skin_L - ref_metrics.skin_L)
+        if m.skin_L is not None and abs(m.skin_L - ref_metrics.skin_L) < before_gap:
+            s["skin_exposure"] = {"before": old[pid]["Exposure2012"], "after": s["final"]["Exposure2012"],
+                                  "skin_L_before": round(s["final_metrics"].skin_L, 1),
+                                  "skin_L_after": round(m.skin_L, 1)}
+            s["matched"] = {**s["matched"], "Exposure2012": round(s["matched"]["Exposure2012"] + moves[pid], 2)}
+            s["final_metrics"], s["preview"] = m, item["path"]
+            s["extra_flags"].append("exposure_from_skin")
+            log(f"{s['photo']['fileName']}: exposure {moves[pid]:+.2f} to match the reference's faces")
+        else:
+            s["final"] = old[pid]
+            undo.append({"id": pid, "settings": _corrective_settings(old[pid])})
+    if undo:
+        _apply(bridge, undo, warnings, log)
 
 
 def _pull_shoot_outliers(state, log=print):
