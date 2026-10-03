@@ -159,6 +159,7 @@ PY -m engine.workflow nudge --run RUN --photo FILE_NAME --mask subject Temperatu
   - A raw file from a JPEG reference's shoot (or the other way round) carries both `same_shoot` and `different_file_type`. Its light is solved, but its tone sliders stay within ±15 and its Tint within ±10, because the two formats render differently. Judge its white paint by eye, and nudge Tint by at most ±6.
   - A raw `same_shoot` photo whose white balance came from the camera keeps it within ±20 mired and Tint ±10, because the light was the same.
   - `wb_from_shoot`: with 3 or more raws from the shoot, this photo's own white-balance solve moved far from the rest (it followed its content, such as a yellow saree or an orange wall), so it got the shoot's median move instead. Check a neutral surface (a white wall) against the reference before nudging, and nudge Temperature only if that surface is off.
+  - `wb_from_reference` (only with `--hold-shoot-wb`): a raw from the reference's shoot that is no longer on As Shot (matched or synced before) has no camera reading, so it keeps the reference's own Temperature and Tint exactly, the ones the user chose for this light. Its own solve would follow sand, grass or cream outfits instead. Judge it next to the reference; if a photo really was shot in other light (deep shade, sunset), nudge its Temperature and say why.
   - `wb_offset_from_reference`: the reference's own white balance was set far from what its camera recorded (read off a photo shot within 10 minutes of it, see `reference_wb_offset` in the report). That choice was carried to this photo: it starts from its own camera reading plus the same offset. Photos from other light keep their own reading but may move far enough to reach the reference's value.
 - If two or more photos end at exactly the same Temperature, say it is probably a limit, not a solved value.
 - `exposure_from_skin` (with `--skin`): matching the frame's overall brightness followed its content (bright clothes, a bright backdrop), so its exposure was set from the faces instead; `skin_exposure` in the report gives the before and after. Judge its brightness on the faces, not the backdrop, and don't nudge its exposure back down unless the faces look brighter than the reference's.
@@ -194,3 +195,8 @@ This is an added step, done after the report in step 5. Skip it if `learnings/` 
 - If a new result contradicts an existing entry, edit that entry and say what changed.
 - If you added a topic file, add its row to the table in `learnings/README.md`.
 - Add one line to the report: which entries you applied and which you added.
+
+## Replaying a run without Lightroom
+This is an added step for engine work, not for grading.
+- `PY -m engine.replay check RUN` shows how closely the run's saved previews can be reproduced (leave-one-out ΔE per photo); `PY -m engine.replay rerun RUN` runs today's engine on that run's photos and writes `RUN/replay/<time>/` with its own report and contact sheets. Learning is never used or changed.
+- To make a run a benchmark, the user fixes a few of its photos by hand in Lightroom after `PY -m engine.workflow learn --run RUN --skip`, then runs `PY -m engine.replay answers RUN`. `PY -m engine.replay bench RUN...` then scores the run as it ran and as today's engine re-runs it against those photos.

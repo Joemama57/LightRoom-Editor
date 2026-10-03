@@ -70,6 +70,15 @@ SAME_SHOOT_TINT = 10.0
 # shoot's move instead.
 SHOOT_OUTLIER_MIRED = 20.0
 SHOOT_OUTLIER_MIN_PHOTOS = 3
+# A raw from the shoot that is no longer on As Shot (matched before, or synced)
+# has no camera reading to start from, so it starts from the reference's white
+# balance: the one the user chose for this very light. Its own solve then only
+# measures content: on a beach wedding (run 20261003-202615) sand, dry grass and
+# cream outfits pulled eight such photos between 4341 K and 6304 K against a
+# reference at 4956 K. With --hold-shoot-wb it is held at the reference's (flag
+# wb_from_reference); off by default until replayed real runs show it helps.
+SHOOT_HOLD_MIRED = 0.0
+SHOOT_HOLD_TINT = 0.0
 # Lightroom doesn't keep a raw's as-shot white balance once it is changed, so the
 # reference's is read off a photo shot within these minutes with the same camera
 # (same light). When the reference was set more than SAME_SHOOT_MIRED away from
@@ -118,6 +127,10 @@ CALM_RATIO = 1.15
 CALM_LIMIT = 15.0
 CALM_ITERATIONS = 3
 CALM_TOLERANCE = 1.0
+# Saturation and Vibrance cuts take warmth out of faces too. A calm step that
+# lowers a photo's skin chroma by more than this (when both renders have
+# reliable skin) is not used; the strongest step that stays inside it is.
+CALM_SKIN_LOSS = 1.5
 # A raw file from the shoot of a JPEG reference (or the other way round) renders
 # very differently: the JPEG has the camera's tone mapping baked in. Its light is
 # still solved, but tone and tint stay close: the light was the same, so a big
@@ -335,6 +348,7 @@ def run_match(
     original=None,
     grades_dir=None,
     refit=False,
+    hold_shoot_wb=False,
 ):
     """Match the selected photos to the active one. See the module docstring.
 
@@ -354,6 +368,9 @@ def run_match(
         by name among the selected photos).
     grades_dir: where fitted grades are kept for re-use (None: don't keep).
     refit: fit the grade again even if one was kept for this reference.
+    hold_shoot_wb: a raw from the reference's shoot that is no longer on As
+        Shot keeps the reference's white balance (SHOOT_HOLD_MIRED). Off by
+        default until real runs (engine/replay.py bench) show it helps.
     runs_dir: where earlier runs live, to learn from edits made since; default
         is out_dir's parent.
     """
@@ -435,10 +452,14 @@ def run_match(
         shoot = not color_only and same_shoot(shoot_ref, t)
         other_format = not color_only and same_shoot_other_format(shoot_ref, t)
         limits_wb = wb_limits(t_raw, wb_from_camera)
+        flags_wb = []
         if shoot:
             tone_limits = (SAME_SHOOT_EV, 0.0)
             if t_raw and wb_from_camera:
                 limits_wb = (min(limits_wb[0], SAME_SHOOT_MIRED), min(limits_wb[1], SAME_SHOOT_TINT))
+            elif t_raw and ref_raw and hold_shoot_wb:
+                limits_wb = (SHOOT_HOLD_MIRED, SHOOT_HOLD_TINT)
+                flags_wb = ["wb_from_reference"]
         elif other_format:
             tone_limits = (Options().tone_limits[0], SHOOT_OTHER_FORMAT_TONE)
             limits_wb = (limits_wb[0], min(limits_wb[1], SHOOT_OTHER_FORMAT_TINT))
@@ -474,6 +495,7 @@ def run_match(
             flags.append("same_shoot")
         if offset_applied:
             flags.append("wb_offset_from_reference")
+        flags += flags_wb
         own = t.get("settings") or {}
         state[t["id"]] = {
             "photo": t, "is_raw": t_raw, "camera": camera, "start": start, "sliders": start,
@@ -483,7 +505,8 @@ def run_match(
             "before_look": _look_fingerprint(own, creative),
             "wb_from_camera": wb_from_camera,
             "options": Options(prior=prior, skin=skin, color_only=color_only,
-                               wb_limits=limits_wb, light_only=light_only, tone_limits=tone_limits),
+                               wb_limits=limits_wb, light_only=light_only, tone_limits=tone_limits,
+                               judge_colour=shoot),
             "same_shoot": shoot or other_format,
             "shoot_wb": shoot and t_raw and wb_from_camera,
             "prior_source": prior_source,
@@ -544,7 +567,7 @@ def run_match(
     finals, rerender = [], []
     for pid, s in state.items():
         p, o = s["proposal"], s["options"]
-        errors = [match_error(s["target"], h["metrics"], skin=o.skin, color_only=o.color_only,
+        errors = [match_error(s["target"], h["metrics"], skin=o.skin, color_only=o.color_only or o.judge_colour,
                               light_only=o.light_only) for h in s["history"]]
         best = min(range(len(errors)), key=errors.__getitem__)
         matched = s["matched"]
@@ -576,7 +599,8 @@ def run_match(
         _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warnings, log)
 
     if look and not (per_photo_look or style or grade_fit):
-        _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint)
+        _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint,
+                     ref_skin_chroma=_skin_chroma(ref_metrics))
 
     if per_photo_look:
         _match_look(bridge, state, creative, ref_path, out_dir, size, look_strength, warnings, log, hint)
@@ -588,7 +612,7 @@ def run_match(
 
     for s in state.values():
         o = s["options"]
-        s["final_error"] = match_error(s["target"], s["final_metrics"], skin=o.skin, color_only=o.color_only,
+        s["final_error"] = match_error(s["target"], s["final_metrics"], skin=o.skin, color_only=o.color_only or o.judge_colour,
                                        light_only=o.light_only)
         s["flags"] = flags_for(s["final_metrics"], s["proposal"], tolerance)
         # Only worth a look when the limit kept it from matching. A photo from
@@ -600,7 +624,9 @@ def run_match(
         if s["same_shoot"]:
             # Judge it on colour alone: its brightness differs by content.
             color_error = match_error(ref_metrics, s["final_metrics"], color_only=True)
-            if color_error < tolerance and "not_converged" in s["flags"]:
+            # Held at the reference's white balance: what colour gap is left is its content.
+            held = "wb_from_reference" in s["extra_flags"]
+            if (color_error < tolerance or held) and "not_converged" in s["flags"]:
                 s["flags"].remove("not_converged")
         elif faces_set:
             if "not_converged" in s["flags"]:
@@ -639,6 +665,9 @@ def run_match(
         "snapshot": None if snap.get("warning") else SNAPSHOT_NAME,
         "warnings": warnings,
         "reference": {"id": ref_id, "fileName": ref["fileName"], "preview": str(ref_path),
+                      "cameraModel": ref.get("cameraModel"), "captureTime": ref.get("captureTime"),
+                      "corrective": {k: ref_corrective.get(k) for k in CORRECTIVE},
+                      "white_balance": (ref.get("settings") or {}).get("WhiteBalance"),
                       "metrics": ref_metrics.to_dict(), "skin": ref_skin,
                       "creative_look": {k: creative[k] for k in look_stage.LOOK_KEYS if k in creative}},
         "photos": [],
@@ -649,6 +678,7 @@ def run_match(
             "id": pid,
             "fileName": s["photo"]["fileName"],
             "camera": s["camera"],
+            "captureTime": s["photo"].get("captureTime"),
             "is_raw": s["is_raw"],
             "light": s["light"],
             "wb_from_camera": s["wb_from_camera"],
@@ -668,6 +698,7 @@ def run_match(
             "look_note": s.get("look_note"),
             "skin_exposure": s.get("skin_exposure"),
             "skin_color": s.get("skin_color"),
+            "skin_color_note": s.get("skin_color_note"),
             "calmed_colour": s.get("calmed_colour"),
             "trace": _trace(s, ref_metrics),
             "flags": s["flags"] + s["extra_flags"],
@@ -688,8 +719,8 @@ def _trace(s, ref_metrics):
     for h in s["history"]:
         m = Metrics.from_dict(h["metrics"])
         rows.append({
-            **{k: h["sliders"][k] for k in ("Temperature", "Tint", "Exposure2012")},
-            "error": round(match_error(s["target"], m, skin=o.skin, color_only=o.color_only, light_only=o.light_only), 2),
+            **{k: h["sliders"][k] for k in CORRECTIVE},  # every slider, so a run can be replayed (engine/replay.py)
+            "error": round(match_error(s["target"], m, skin=o.skin, color_only=o.color_only or o.judge_colour, light_only=o.light_only), 2),
             "a": round(m.a, 1), "b": round(m.b, 1), "p50": round(m.L["p50"], 1),
             "skin_a": None if m.skin_a is None else round(m.skin_a, 1),
             "skin_b": None if m.skin_b is None else round(m.skin_b, 1),
@@ -758,7 +789,7 @@ def _anchor_exposure_on_skin(bridge, state, ref_metrics, out_dir, size, hint, wa
         _apply(bridge, undo, warnings, log)
 
 
-def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint):
+def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log, hint, ref_skin_chroma=None):
     """Take Vibrance and Saturation off photos that ended much more colourful
     than the reference (see CALM_RATIO). Only ever lowers them, and a photo
     that doesn't get closer keeps the reference's own values."""
@@ -811,6 +842,7 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
     finals, rerender = [], []
     for pid, s in todo.items():
         offsets = {k: min(v, 0.0) for k, v in s["calm_proposal"].offsets.items()}
+        offsets = _skin_safe_calm(s, offsets, ref_chroma, ref_skin_chroma, log)
         settings = look_stage.to_settings(offsets, creative)
         finals.append({"id": pid, "settings": settings})
         if not any(offsets.values()):
@@ -843,6 +875,41 @@ def _calm_colour(bridge, state, creative, ref_path, out_dir, size, warnings, log
             log(f"{s['photo']['fileName']}: colour calmed ({look_stage.describe(s['calmed_colour']['offsets'])}); "
                 f"chroma {s['calmed_colour']['chroma_before']['mean']} -> {s['calmed_colour']['chroma_after']['mean']} "
                 f"(reference {s['calmed_colour']['chroma_reference']['mean']})")
+
+
+def _skin_chroma(m):
+    return float(np.hypot(m.skin_a, m.skin_b)) if _reliable_skin(m) else None
+
+
+def _skin_safe_calm(s, offsets, ref_chroma, ref_skin_chroma, log):
+    """The calm offsets, or the strongest tried step that keeps the faces' chroma
+    within CALM_SKIN_LOSS of what it was before calming, or of the reference's
+    faces if they were more colourful than those (see CALM_SKIN_LOSS)."""
+    history = s["calm_history"]
+    base = _skin_chroma(history[0]["metrics"])
+    if base is None or not any(offsets.values()):
+        return offsets
+
+    floor = min(base, ref_skin_chroma if ref_skin_chroma is not None else base) - CALM_SKIN_LOSS
+
+    def safe(h):
+        c = _skin_chroma(h["metrics"])
+        return c is None or c >= floor
+
+    chosen = next((h for h in history if _same_offsets(h["offsets"], offsets)), None)
+    if chosen is not None and safe(chosen):
+        return offsets
+    steps = [h for h in history[1:] if safe(h) and any(v < 0 for v in h["offsets"].values())]
+    if not steps:
+        log(f"{s['photo']['fileName']}: colour left as the reference's (calming it would take the warmth out of the faces)")
+        return {k: 0.0 for k in offsets}
+
+    def distance(h):
+        return min(h["look"]["chroma"][k] / max(ref_chroma[k], 1e-6) for k in ("mean", "top"))
+
+    best = min(steps, key=distance)
+    log(f"{s['photo']['fileName']}: calmed colour only partway to keep the faces' warmth")
+    return {k: min(v, 0.0) for k, v in best["offsets"].items()}
 
 
 def _shift_wb(sliders, dx, is_raw):
@@ -917,10 +984,12 @@ def _anchor_color_on_skin(bridge, state, ref_metrics, out_dir, size, hint, warni
             )
             if not helped:
                 if m.skin_a is not None:
-                    log(f"{s['photo']['fileName']}: kept its white balance (faces off by "
-                        f"{np.hypot(*gap(before)):.1f} -> {np.hypot(*gap(m)):.1f}, neutrals off by "
-                        f"{match_error(ref_metrics, before, color_only=True):.1f} -> "
-                        f"{match_error(ref_metrics, m, color_only=True):.1f})")
+                    note = (f"kept its white balance (faces off by "
+                            f"{np.hypot(*gap(before)):.1f} -> {np.hypot(*gap(m)):.1f}, neutrals off by "
+                            f"{match_error(ref_metrics, before, color_only=True):.1f} -> "
+                            f"{match_error(ref_metrics, m, color_only=True):.1f})")
+                    s["skin_color_note"] = note  # in the report: why the pass left it alone
+                    log(f"{s['photo']['fileName']}: {note}")
                 s["final"] = old[pid]
                 undo.append({"id": pid, "settings": _corrective_settings(old[pid])})
                 del live[pid]
@@ -1850,6 +1919,8 @@ def main(argv=None):
                         "reference from outside the catalog, use this instead of copying one grade")
     m.add_argument("--original", help="file name of the reference's unedited original, if not found by name")
     m.add_argument("--refit", action="store_true", help="learn an exported reference's grade again")
+    m.add_argument("--hold-shoot-wb", action="store_true",
+                   help="photos from the reference's shoot keep its white balance (when not on As Shot)")
     m.add_argument("--tolerance", type=float, default=2.0)
     m.add_argument("--max-iterations", type=int, default=6)
     m.add_argument("--size", type=int, default=1024, help="preview long edge in pixels")
@@ -1885,7 +1956,8 @@ def main(argv=None):
                                runs_dir=RUNS_DIR if not args.out else None, log=log,
                                look=not args.no_look, look_strength=args.look_strength,
                                look_per_photo=args.look_per_photo, original=args.original,
-                               grades_dir=RUNS_DIR.parent / "grades", refit=args.refit)
+                               grades_dir=RUNS_DIR.parent / "grades", refit=args.refit,
+                               hold_shoot_wb=args.hold_shoot_wb)
             print(json.dumps({"run": str(out), **_summary(report)}, indent=2))
         elif args.cmd == "nudge":
             done = run_nudge(bridge, args.run, args.photo,

@@ -127,3 +127,13 @@ def test_content_target_leaves_a_darker_frame_to_be_brightened():
 def test_content_target_does_not_keep_an_overexposed_frame():
     assert solver.content_target(_flat(50), _flat(70, p99=99.0), 0.5).L["p50"] == 50
     assert solver.content_target(_flat(50), _flat(70, clipped=0.2), 0.5).L["p50"] == 50
+
+
+def test_a_shoot_photo_is_judged_on_colour_not_on_its_brightness_gap():
+    from dataclasses import replace
+    ref = _flat(50)
+    off_colour = {"sliders": {"Temperature": 4000, "Tint": 0.0}, "metrics": replace(_flat(50), b=6.0).to_dict()}
+    on_colour = {"sliders": {"Temperature": 5500, "Tint": 0.0}, "metrics": replace(_flat(75), b=0.0).to_dict()}
+    for opts, expected in ((solver.Options(), 4000), (solver.Options(judge_colour=True), 5500)):
+        p = propose(ref, [off_colour, on_colour], is_raw=True, max_iterations=1, options=opts)
+        assert p.done and p.sliders["Temperature"] == expected

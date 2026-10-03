@@ -108,6 +108,11 @@ class Options:
     # brightness; the tone sliders stay put. Used when a fitted grade already
     # sets the tone, so content differences don't drive the tone sliders.
     light_only: bool = False
+    # Judge each render (best pick, done) on colour alone while the solve still
+    # moves exposure toward the mid-tones. For a photo from the reference's shoot,
+    # whose brightness is held near the reference's: its tone gap is content, a
+    # constant that would otherwise decide which white balance counts as "best".
+    judge_colour: bool = False
 
 
 @dataclass
@@ -242,8 +247,8 @@ def propose(ref, history, is_raw, tolerance=2.0, max_iterations=6, anchor=1.0, d
     target = _metric_vector(ref)
     xs = [_to_internal(h["sliders"], is_raw) for h in history]
     ms = [_metric_vector(h["metrics"]) for h in history]
-    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only, light_only=opts.light_only)
-              for h in history]
+    errors = [match_error(ref, h["metrics"], skin=opts.skin, color_only=opts.color_only or opts.judge_colour,
+                          light_only=opts.light_only) for h in history]
     best = int(np.argmin(errors))
 
     iterations = len(history) - 1

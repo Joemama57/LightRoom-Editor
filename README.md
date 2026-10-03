@@ -64,13 +64,15 @@ By hand:
 .venv/bin/python -m engine.workflow learn [--skip] # learn now from edits made since the last run (or skip it)
 .venv/bin/python -m engine.workflow calibrate
 .venv/bin/python -m engine.learning show | reset [--preferences] | restore --run DIR
+.venv/bin/python -m engine.replay check | rerun | answers RUN   # replay a saved run without Lightroom (engine work)
+.venv/bin/python -m engine.replay bench RUN...                 # score runs against the photos you fixed by hand
 ```
 Each run writes `report.json`, `contact_sheet_before.jpg` and `contact_sheet.jpg` to `~/.matchlook/runs/<time>/`.
 
 ## Layout
 ```
 MatchLook.lrplugin/        Lightroom plugin: file-based bridge (~/.matchlook/bridge)
-engine/                    measure, solver (light), look (colour and contrast), align (crop finder), skin model, learning, settings split, workflow, contact sheet
+engine/                    measure, solver (light), look (colour and contrast), align (crop finder), skin model, learning, settings split, workflow, contact sheet, replay (saved runs as a benchmark)
 data/skin_sources.json     measured skin colour data (with sources and licenses)
 tools/build_skin_model.py  builds engine/data/skin_model.json and docs/SKIN_TONES.md from it
 .claude/skills/match-look  the /match-look command for Claude Code

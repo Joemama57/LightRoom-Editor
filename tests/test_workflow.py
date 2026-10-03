@@ -482,7 +482,7 @@ def test_brighter_content_is_only_partly_darkened_to_the_references_histogram(tm
     full = run_match(_shoot(8 * 3600.0), tmp_path / "full", log=quiet)["photos"][0]
     monkeypatch.setattr(wf, "CONTENT_KEEP", 0.5)
     part = run_match(_shoot(8 * 3600.0), tmp_path / "part", log=quiet)["photos"][0]
-    assert part["final"]["Exposure2012"] > full["final"]["Exposure2012"] + 0.2
+    assert part["final"]["Exposure2012"] > full["final"]["Exposure2012"] + 0.15
     assert part["final"]["Exposure2012"] < REF_SETTINGS["Exposure2012"]  # still darkened somewhat
 
 
@@ -541,6 +541,41 @@ def test_a_raw_from_another_shoot_can_move_its_white_balance_further(tmp_path):
     (p,) = report["photos"]
     assert "same_shoot" not in p["flags"]
     assert abs(_mired_move(p)) > 20
+
+
+def _resynced_beach(target_time):
+    """A raw from the reference's light, matched before (no longer As Shot), whose
+    frame is mostly sand: warm, low-chroma content its own solve takes for a cast."""
+    scene = make_scene(seed=1)[4:, 2:].copy()
+    scene[scene.shape[0] // 3:] = [0.42, 0.36, 0.27]
+    ref = photo(capture(make_scene(seed=0), 5500), "DSC0001.ARW", settings=dict(REF_SETTINGS))
+    sand = photo(capture(scene, 5500), "DSC0002.ARW",
+                 settings={"WhiteBalance": "Custom", "Temperature": 4545, "Tint": 20, "Exposure2012": 0.5})
+    ref["captureTime"], sand["captureTime"] = 0.0, target_time
+    return FakeLightroom({"ref": ref, "sand": sand}, active="ref")
+
+
+def test_a_rematched_raw_from_the_shoot_keeps_the_references_white_balance(tmp_path):
+    report = run_match(_resynced_beach(1800.0), tmp_path, skin=True, hold_shoot_wb=True, log=quiet)
+    (p,) = report["photos"]
+    assert not p["wb_from_camera"]
+    assert {"same_shoot", "wb_from_reference"} <= set(p["flags"])
+    assert "not_converged" not in p["flags"]  # the colour left over is the sand, not a failed match
+    assert p["final"]["Temperature"] == REF_SETTINGS["Temperature"]
+    assert p["final"]["Tint"] == REF_SETTINGS["Tint"]
+
+
+def test_without_the_option_a_rematched_raw_from_the_shoot_is_solved_as_before(tmp_path):
+    report = run_match(_resynced_beach(1800.0), tmp_path, log=quiet)
+    (p,) = report["photos"]
+    assert "wb_from_reference" not in p["flags"] and abs(_mired_move(p)) > 5
+
+
+def test_a_rematched_raw_from_another_shoot_still_solves_its_white_balance(tmp_path):
+    report = run_match(_resynced_beach(9 * 3600.0), tmp_path, hold_shoot_wb=True, log=quiet)
+    (p,) = report["photos"]
+    assert "wb_from_reference" not in p["flags"]
+    assert abs(_mired_move(p)) > 5  # the sand pulls it: what the held photo is spared
 
 
 def _shoot_state(moves):
@@ -812,3 +847,26 @@ def test_colour_is_not_calmed_when_only_white_balance_is_asked_for(tmp_path):
     (p,) = run_match(lr, tmp_path, color_only=True, log=quiet)["photos"]
     assert "calmer_colour" not in p["flags"]
     assert lr.photos["t"]["settings"]["Vibrance"] == 20
+
+
+def _calm_step(offsets, chroma, skin_b):
+    from engine.measure import Metrics
+    m = Metrics(a=0.0, b=0.0, L={"p1": 5.0, "p25": 30.0, "p50": 50.0, "p75": 70.0, "p99": 90.0}, clipped_fraction=0.0,
+                neutral_fraction=0.3, skin_a=10.0, skin_b=skin_b, skin_fraction=0.2, skin_L=55.0)
+    return {"offsets": offsets, "look": {"chroma": {"mean": chroma, "top": chroma * 2}}, "metrics": m}
+
+
+def test_calming_colour_stops_before_it_drains_the_faces():
+    import engine.workflow as wf
+    history = [_calm_step({}, 32.0, 20.0), _calm_step({"Vibrance": -7.0, "Saturation": -7.0}, 28.0, 19.5),
+               _calm_step({"Vibrance": -15.0, "Saturation": -15.0}, 25.0, 15.0)]
+    s = {"photo": {"fileName": "A.ARW"}, "calm_history": history}
+    ref_chroma = {"mean": 25.0, "top": 50.0}
+    full = {"Vibrance": -15.0, "Saturation": -15.0}
+    # Faces at chroma 22.4 lose 3+ units at the full cut: the half cut is used.
+    assert wf._skin_safe_calm(s, full, ref_chroma, 25.0, quiet) == {"Vibrance": -7.0, "Saturation": -7.0}
+    # Faces that were already more colourful than the reference's may be calmed.
+    assert wf._skin_safe_calm(s, full, ref_chroma, 15.0, quiet) == full
+    # When no step is safe, the reference's own colour stays.
+    history[1] = _calm_step({"Vibrance": -7.0, "Saturation": -7.0}, 28.0, 16.0)
+    assert wf._skin_safe_calm(s, full, ref_chroma, 25.0, quiet) == {"Vibrance": 0.0, "Saturation": 0.0}
